@@ -1,9 +1,9 @@
 use axum::{
     routing::get,
     routing::post,
-    Json,
-    Router,
+    Json, Router,
 };
+use tower_http::cors::{CorsLayer, Any};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use uuid::Uuid;
@@ -90,14 +90,21 @@ async fn reconcile() -> Json<String> {
 
 #[tokio::main]
 async fn main() {
+    let cors = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods(tower_http::cors::Method::GET)
+        .allow_methods(tower_http::cors::Method::POST)
+        .allow_headers([axum::http::header::CONTENT_TYPE]);
+
     let app = Router::new()
         .route("/api/accounts", get(get_accounts))
         .route("/api/invoices", get(get_invoices))
         .route("/api/invoices", post(create_invoice))
         .route("/api/ledger", get(get_ledger))
-        .route("/api/reconcile", get(reconcile));
+        .route("/api/reconcile", get(reconcile))
+        .layer(cors);
 
-    let addr = SocketAddr::from(([127, 0, 0, 1], 3001));
+    let addr = SocketAddr::from(([127, 0, 0, 1], 4000));
     println!("NexusLedger backend running on http://{}", addr);
     axum::serve(
         tokio::net::TcpListener::bind(addr).await.unwrap(),

@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect } from "react";
 
 interface Account {
   id: string;
@@ -26,15 +26,15 @@ function App() {
       try {
         setLoading(true);
         const [accountsRes, invoicesRes] = await Promise.all([
-          fetch('http://localhost:3001/api/accounts'),
-          fetch('http://localhost:3001/api/invoices'),
+          fetch("http://localhost:4000/api/accounts"),
+          fetch("http://localhost:4000/api/invoices"),
         ]);
         const accountsData = await accountsRes.json();
         const invoicesData = await invoicesRes.json();
         setAccounts(accountsData);
         setInvoices(invoicesData);
       } catch (err) {
-        setError(err instanceof Error ? err.message : 'Unknown error');
+        setError(err instanceof Error ? err.message : "Unknown error");
       } finally {
         setLoading(false);
       }
@@ -44,19 +44,19 @@ function App() {
 
   const handleCreateInvoice = async () => {
     try {
-      const response = await fetch('http://localhost:3001/api/invoices', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+      const response = await fetch("http://localhost:4000/api/invoices", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          customer: 'Test Customer',
+          customer: "Test Customer",
           amount: 100.0,
-          description: 'Test Invoice',
+          description: "Test Invoice",
         }),
       });
       const newInvoice = await response.json();
       setInvoices([...invoices, newInvoice]);
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Unknown error');
+      setError(err instanceof Error ? err.message : "Unknown error");
     }
   };
 
