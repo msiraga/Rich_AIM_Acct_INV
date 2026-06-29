@@ -1,0 +1,137 @@
+# NexusLedger Server Configuration
+# Author: Mounir Siraji <mounir@richdaleai.com>
+# License: Apache-2.0
+
+[server]
+# HTTP server configuration
+port = 8080
+host = "0.0.0.0"
+workers = 4
+max_connections = 1000
+connection_timeout = 30
+
+[database]
+# SurrealDB configuration
+# Options: "ws://host:port" for WebSocket, "mem://" for in-memory
+url = "ws://localhost:8000"
+ns = "nexus"
+db = "accounting"
+
+# Connection settings
+timeout = 30
+retry_attempts = 3
+retry_delay = 1000
+
+[ai]
+# AI/ML configuration for Ollama integration
+ollama_url = "http://localhost:11434"
+model = "llama3.2"
+timeout = 120
+temperature = 0.7
+max_tokens = 2048
+
+# Agent-specific settings
+[ai.agents]
+document_agent_enabled = true
+ledger_agent_enabled = true
+reconciliation_agent_enabled = true
+tax_agent_enabled = true
+payroll_agent_enabled = true
+audit_agent_enabled = true
+reporting_agent_enabled = true
+forecasting_agent_enabled = true
+compliance_agent_enabled = true
+
+[logging]
+# Logging configuration
+level = "info"
+file = "data/logs/nexusledger.log"
+max_file_size = 10485760  # 10MB
+max_files = 5
+
+# Console logging
+console_enabled = true
+console_level = "info"
+
+[storage]
+# File storage configuration
+data_dir = "data"
+invoices_dir = "data/invoices"
+receipts_dir = "data/receipts"
+documents_dir = "data/documents"
+statements_dir = "data/statements"
+logs_dir = "data/logs"
+exports_dir = "data/exports"
+certs_dir = "data/certs"
+
+# File processing
+max_file_size = 10485760  # 10MB
+allowed_extensions = ["pdf", "png", "jpg", "jpeg", "txt", "csv", "json"]
+
+[security]
+# Security configuration
+secret_key = "change-this-in-production-to-a-strong-secret"
+jwt_expiry = 86400  # 24 hours in seconds
+password_min_length = 8
+max_login_attempts = 5
+lockout_duration = 900  # 15 minutes in seconds
+
+# CORS settings
+cors_enabled = true
+cors_origins = ["http://localhost:3000", "http://localhost:8080"]
+cors_methods = ["GET", "POST", "PUT", "DELETE", "OPTIONS"]
+cors_headers = ["Content-Type", "Authorization"]
+
+[features]
+# Feature flags
+enable_ai = true
+enable_multi_user = true
+enable_audit_log = true
+enable_bank_feeds = false
+enable_tax_filings = false
+enable_payroll = true
+enable_reporting = true
+enable_forecasting = true
+enable_compliance = true
+
+[limits]
+# System limits
+max_transactions_per_request = 1000
+max_documents_per_request = 100
+max_agents_per_user = 50
+max_concurrent_tasks = 100
+rate_limit_requests = 1000
+rate_limit_period = 60  # seconds
+
+[performance]
+# Performance tuning
+agent_pool_size = 10
+task_timeout = 300  # 5 minutes
+document_processing_timeout = 600  # 10 minutes
+cache_enabled = true
+cache_size = 1000
+
+[notifications]
+# Notification settings
+enable_email = false
+smtp_host = "smtp.example.com"
+smtp_port = 587
+smtp_username = ""
+smtp_password = ""
+smtp_from = "nexusledger@example.com"
+
+# Desktop notifications
+enable_desktop = true
+
+[backup]
+# Backup configuration
+enable_auto_backup = true
+backup_interval = 86400  # 24 hours in seconds
+backup_dir = "data/backups"
+max_backups = 7
+
+[updates]
+# Update configuration
+check_for_updates = true
+update_interval = 86400  # 24 hours in seconds
+auto_update = false
