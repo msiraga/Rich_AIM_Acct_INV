@@ -1,0 +1,46 @@
+version: '3.8'
+
+services:
+  nexusledger:
+    build: .
+    container_name: nexusledger
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+      - "8081:8081"
+    volumes:
+      - ./data:/usr/src/nexusledger/data
+      - ./config:/usr/src/nexusledger/config
+    environment:
+      - RUST_LOG=info
+      - SURREALDB_URL=ws://surrealdb:8000
+      - SURREALDB_NS=nexus
+      - SURREALDB_DB=accounting
+    depends_on:
+      - surrealdb
+
+  surrealdb:
+    image: surrealdb/surrealdb:latest
+    container_name: surrealdb
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data/surrealdb:/data
+    command: start --bind 0.0.0.0:8000 --log info
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    volumes:
+      - ./data/ollama:/root/.ollama
+    environment:
+      - OLLAMA_HOST=0.0.0.0
+
+volumes:
+  nexusledger_data:
+  surrealdb_data:
+  ollama_data:
