@@ -6,8 +6,8 @@
 target/
 *.rs.bk
 
-# Cargo lock files (optional - some prefer to commit these)
-# Cargo.lock
+# Cargo lock files
+Cargo.lock
 
 # IDE specific files
 .idea/
