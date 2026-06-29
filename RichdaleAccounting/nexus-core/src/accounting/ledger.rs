@@ -60,6 +60,12 @@ impl LedgerError {
     }
 }
 
+impl From<String> for LedgerError {
+    fn from(s: String) -> Self {
+        LedgerError::Other(s)
+    }
+}
+
 /// Result type for ledger operations
 pub type LedgerResult<T> = Result<T, LedgerError>;
 
@@ -76,6 +82,8 @@ pub struct Ledger {
     pub current_journal_number: Arc<Mutex<u64>>,
     /// Current transaction number
     pub current_transaction_number: Arc<Mutex<u64>>,
+    /// Optional database connection for SurrealDB persistence
+    pub db: Option<Arc<crate::database::Database>>,
 }
 
 impl Default for Ledger {
@@ -93,6 +101,7 @@ impl Ledger {
             journal_entries: Arc::new(RwLock::new(BTreeMap::new())),
             current_journal_number: Arc::new(Mutex::new(1)),
             current_transaction_number: Arc::new(Mutex::new(1)),
+            db: None,
         }
     }
 
@@ -156,10 +165,46 @@ impl Ledger {
         // Set creation timestamp
         account.created_at = Utc::now();
         account.updated_at = Utc::now();
-        
+
         // Insert the account
         self.accounts.write().await.insert(account.id, account.clone());
-        
+
+        // Persist to SurrealDB if configured (additive, non-blocking on failure)
+        if let Some(ref db) = self.db {
+            if let Ok(client) = db.db().await {
+                let account_type_str = format!("{:?}", account.account_type);
+                let status_str = format!("{:?}", account.status);
+                let parent_id_str = account.parent_id.map(|id| id.to_string());
+                if let Err(e) = client.query(
+                    "CREATE account SET \
+                     id = $id, number = $number, name = $name, \
+                     description = $description, account_type = $account_type, \
+                     parent_id = $parent_id, status = $status, \
+                     balance = $balance, currency = $currency, \
+                     is_bank_account = $is_bank_account, \
+                     is_reconciled = $is_reconciled, \
+                     created_at = $created_at, updated_at = $updated_at"
+                )
+                .bind(("id", account.id.to_string()))
+                .bind(("number", account.number.clone()))
+                .bind(("name", account.name.clone()))
+                .bind(("description", account.description.clone()))
+                .bind(("account_type", account_type_str))
+                .bind(("parent_id", parent_id_str))
+                .bind(("status", status_str))
+                .bind(("balance", account.balance.to_string()))
+                .bind(("currency", account.currency.clone()))
+                .bind(("is_bank_account", account.is_bank_account))
+                .bind(("is_reconciled", account.is_reconciled))
+                .bind(("created_at", account.created_at.to_rfc3339()))
+                .bind(("updated_at", account.updated_at.to_rfc3339()))
+                .await
+                {
+                    warn!("Failed to persist account {} to SurrealDB: {}", account.number, e);
+                }
+            }
+        }
+
         Ok(account)
     }
 
@@ -222,7 +267,7 @@ impl Ledger {
     }
 
     /// Record a transaction
-    pub async fn record_transaction(&mut self, mut transaction: Transaction) -> LedgerResult<Transaction> {
+    pub async fn record_transaction(&self, mut transaction: Transaction) -> LedgerResult<Transaction> {
         info!("Recording transaction: {}", transaction.description);
         
         // Validate the transaction
@@ -250,7 +295,107 @@ impl Ledger {
         
         // Update the transaction with journal entry ID
         self.transactions.write().await.insert(transaction.id, transaction.clone());
-        
+
+        // Persist to SurrealDB if configured (additive, non-blocking on failure)
+        if let Some(ref db) = self.db {
+            if let Ok(client) = db.db().await {
+                // Persist the transaction
+                let txn_type_str = format!("{:?}", transaction.transaction_type);
+                let txn_status_str = format!("{:?}", transaction.status);
+                let journal_id_str = transaction.journal_entry_id.map(|id| id.to_string());
+                if let Err(e) = client.query(
+                    "CREATE transaction SET \
+                     id = $id, number = $number, description = $description, \
+                     date = $date, transaction_type = $transaction_type, \
+                     status = $status, journal_entry_id = $journal_entry_id, \
+                     created_at = $created_at, updated_at = $updated_at"
+                )
+                .bind(("id", transaction.id.to_string()))
+                .bind(("number", transaction.number.clone()))
+                .bind(("description", transaction.description.clone()))
+                .bind(("date", transaction.date.to_rfc3339()))
+                .bind(("transaction_type", txn_type_str))
+                .bind(("status", txn_status_str))
+                .bind(("journal_entry_id", journal_id_str))
+                .bind(("created_at", transaction.created_at.to_rfc3339()))
+                .bind(("updated_at", transaction.updated_at.to_rfc3339()))
+                .await
+                {
+                    warn!("Failed to persist transaction {} to SurrealDB: {}", transaction.number, e);
+                }
+
+                // Persist individual transaction entries
+                for entry in &transaction.entries {
+                    let entry_type_str = format!("{:?}", entry.entry_type);
+                    let reference_str = entry.reference.clone();
+                    if let Err(e) = client.query(
+                        "CREATE transaction_entry SET \
+                         id = $id, transaction_id = $transaction_id, \
+                         account_id = $account_id, entry_type = $entry_type, \
+                         amount = $amount, description = $description, \
+                         reference = $reference"
+                    )
+                    .bind(("id", entry.id.to_string()))
+                    .bind(("transaction_id", transaction.id.to_string()))
+                    .bind(("account_id", entry.account_id.to_string()))
+                    .bind(("entry_type", entry_type_str))
+                    .bind(("amount", entry.amount.to_string()))
+                    .bind(("description", entry.description.clone()))
+                    .bind(("reference", reference_str))
+                    .await
+                    {
+                        warn!("Failed to persist transaction entry to SurrealDB: {}", e);
+                    }
+                }
+
+                // Persist the journal entry
+                let journal_ref_str = journal_entry.reference.clone();
+                if let Err(e) = client.query(
+                    "CREATE journal_entry SET \
+                     id = $id, number = $number, description = $description, \
+                     reference = $reference, date = $date, \
+                     is_posted = $is_posted, is_reconciled = $is_reconciled, \
+                     created_at = $created_at, updated_at = $updated_at"
+                )
+                .bind(("id", journal_entry.id.to_string()))
+                .bind(("number", journal_entry.number.clone()))
+                .bind(("description", journal_entry.description.clone()))
+                .bind(("reference", journal_ref_str))
+                .bind(("date", journal_entry.date.to_string()))
+                .bind(("is_posted", journal_entry.is_posted))
+                .bind(("is_reconciled", journal_entry.is_reconciled))
+                .bind(("created_at", journal_entry.created_at.to_rfc3339()))
+                .bind(("updated_at", journal_entry.updated_at.to_rfc3339()))
+                .await
+                {
+                    warn!("Failed to persist journal entry {} to SurrealDB: {}", journal_entry.number, e);
+                }
+
+                // Update account balances in SurrealDB
+                for entry in &transaction.entries {
+                    let entry_type_str = format!("{:?}", entry.entry_type);
+                    if let Err(e) = client.query(
+                        "UPDATE account SET \
+                         balance = $balance, updated_at = $updated_at \
+                         WHERE id = $account_id"
+                    )
+                    .bind(("account_id", entry.account_id.to_string()))
+                    .bind(("updated_at", Utc::now().to_rfc3339()))
+                    .bind(("balance", {
+                        // Read the current in-memory balance (already updated above)
+                        let accounts = self.accounts.read().await;
+                        accounts.get(&entry.account_id)
+                            .map(|a| a.balance.to_string())
+                            .unwrap_or_else(|| entry.amount.to_string())
+                    }))
+                    .await
+                    {
+                        warn!("Failed to update account balance in SurrealDB for entry type {}: {}", entry_type_str, e);
+                    }
+                }
+            }
+        }
+
         Ok(transaction)
     }
 
@@ -278,12 +423,12 @@ impl Ledger {
     }
 
     /// Update account balances based on transaction entries
-    async fn update_account_balances(&mut self, transaction: &Transaction) -> LedgerResult<()> {
+    async fn update_account_balances(&self, transaction: &Transaction) -> LedgerResult<()> {
         let mut accounts = self.accounts.write().await;
         
         for entry in &transaction.entries {
             if let Some(account) = accounts.get_mut(&entry.account_id) {
-                account.update_balance(entry.amount, entry.entry_type);
+                account.update_balance(entry.amount, entry.entry_type.clone());
             }
         }
         
@@ -291,7 +436,7 @@ impl Ledger {
     }
 
     /// Create a journal entry from a transaction
-    async fn create_journal_entry(&mut self, transaction: &Transaction) -> LedgerResult<JournalEntry> {
+    async fn create_journal_entry(&self, transaction: &Transaction) -> LedgerResult<JournalEntry> {
         let mut counter = self.current_journal_number.lock().await;
         let journal_number = format!("JE-{:08}", *counter);
         *counter += 1;
@@ -509,13 +654,13 @@ impl Agent for LedgerAgent {
 impl LedgerAgent {
     /// Process a record transaction task
     async fn process_record_transaction(&self, task: Task) -> Result<Task, anyhow::Error> {
-        self.status = AgentStatus::Busy;
-        
+        // Status tracking deferred - requires interior mutability
+
         let start_time = std::time::Instant::now();
-        
+
         // Extract transaction from task payload
-        let transaction = match task.payload {
-            TaskPayload::Transaction(txn) => txn,
+        let transaction = match &task.payload {
+            TaskPayload::Transaction(txn) => txn.clone(),
             _ => return Err(AgentError::TaskProcessingFailed(
                 "Expected Transaction payload for RecordTransaction task".to_string()
             ).into()),
@@ -523,17 +668,17 @@ impl LedgerAgent {
 
         // Record the transaction in the ledger
         let recorded_transaction = self.ledger.record_transaction(transaction).await?;
-        
+
         // Create success result
         let result = TaskResult::success_with_data(
             "Transaction recorded successfully",
             TaskPayload::Transaction(recorded_transaction)
         );
-        
+
         let processing_time = start_time.elapsed().as_millis() as f64;
-        
-        self.status = AgentStatus::Idle;
-        
+
+        // Status tracking deferred - requires interior mutability
+
         Ok(task.complete(result))
     }
 }

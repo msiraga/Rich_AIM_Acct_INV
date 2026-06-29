@@ -97,12 +97,6 @@ impl DatabaseError {
     }
 }
 
-impl fmt::Display for DatabaseError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.message())
-    }
-}
-
 /// Result type for database operations
 pub type DatabaseResult<T> = Result<T, DatabaseError>;
 

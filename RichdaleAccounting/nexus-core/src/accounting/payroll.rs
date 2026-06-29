@@ -3,6 +3,7 @@
 //! Handles payroll calculations, processing, and reporting.
 
 use async_trait::async_trait;
+use serde::{Serialize, Deserialize};
 use std::collections::{HashMap, BTreeMap};
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
@@ -292,7 +293,7 @@ impl Default for PayPeriodStatus {
 }
 
 /// Time entry for payroll
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TimeEntry {
     /// Unique identifier
     pub id: Uuid,
@@ -375,6 +376,8 @@ pub struct PayrollProcessor {
     pub time_entries: Arc<RwLock<BTreeMap<Uuid, TimeEntry>>>,
     /// Current pay period
     pub current_pay_period: Arc<Mutex<Option<PayPeriod>>>,
+    /// Optional SurrealDB connection for persistence
+    pub db: Option<Arc<crate::database::Database>>,
 }
 
 impl Default for PayrollProcessor {
@@ -391,6 +394,7 @@ impl PayrollProcessor {
             pay_periods: Arc::new(RwLock::new(BTreeMap::new())),
             time_entries: Arc::new(RwLock::new(BTreeMap::new())),
             current_pay_period: Arc::new(Mutex::new(None)),
+            db: None,
         }
     }
 
@@ -434,22 +438,32 @@ impl PayrollProcessor {
     /// Create a new employee
     pub async fn create_employee(&mut self, mut employee: Employee) -> PayrollResult<Employee> {
         debug!("Creating employee: {} {}", employee.first_name, employee.last_name);
-        
+
         // Check if employee number already exists
         let employees = self.employees.read().await;
         if employees.values().any(|e| e.number == employee.number) {
             return Err(PayrollError::other(&format!("Employee number {} already exists", employee.number)));
         }
-        
+
         drop(employees);
-        
+
         // Set timestamps
         employee.created_at = Utc::now();
         employee.updated_at = Utc::now();
-        
+
         // Insert the employee
         self.employees.write().await.insert(employee.id, employee.clone());
-        
+
+        // Persist to SurrealDB if available
+        if let Some(ref db) = self.db {
+            if let Ok(client) = db.db().await {
+                let value = serde_json::to_value(&employee).unwrap_or_default();
+                if let Err(e) = client.create::<Vec<serde_json::Value>>("employee").content(value).await {
+                    warn!("Failed to persist employee to SurrealDB: {}", e);
+                }
+            }
+        }
+
         Ok(employee)
     }
 
@@ -505,18 +519,28 @@ impl PayrollProcessor {
     /// Record time for an employee
     pub async fn record_time(&mut self, time_entry: TimeEntry) -> PayrollResult<TimeEntry> {
         debug!("Recording time for employee {}", time_entry.employee_id);
-        
+
         // Validate employee exists
         let employees = self.employees.read().await;
         if !employees.contains_key(&time_entry.employee_id) {
             return Err(PayrollError::EmployeeNotFound(time_entry.employee_id.to_string()));
         }
-        
+
         drop(employees);
-        
+
         // Insert the time entry
         self.time_entries.write().await.insert(time_entry.id, time_entry.clone());
-        
+
+        // Persist to SurrealDB if available
+        if let Some(ref db) = self.db {
+            if let Ok(client) = db.db().await {
+                let value = serde_json::to_value(&time_entry).unwrap_or_default();
+                if let Err(e) = client.create::<Vec<serde_json::Value>>("time_entry").content(value).await {
+                    warn!("Failed to persist time entry to SurrealDB: {}", e);
+                }
+            }
+        }
+
         Ok(time_entry)
     }
 
@@ -626,7 +650,7 @@ impl PayrollProcessor {
         };
         
         // Adjust for allowances
-        let allowance_adjustment = dec!(100) * dec!(employee.tax_info.federal_allowances as i64);
+        let allowance_adjustment = dec!(100) * Decimal::from(employee.tax_info.federal_allowances as i64);
         let taxable_amount = gross_pay - allowance_adjustment;
         
         Ok(taxable_amount * rate)
@@ -644,7 +668,7 @@ impl PayrollProcessor {
         };
         
         // Adjust for allowances
-        let allowance_adjustment = dec!(50) * dec!(employee.tax_info.state_allowances as i64);
+        let allowance_adjustment = dec!(50) * Decimal::from(employee.tax_info.state_allowances as i64);
         let taxable_amount = gross_pay - allowance_adjustment;
         
         Ok(taxable_amount * rate)
@@ -694,7 +718,7 @@ impl PayrollProcessor {
     }
 
     /// Process payroll for a pay period
-    pub async fn process_payroll(&mut self, pay_period_id: Uuid) -> PayrollResult<Vec<PayrollCalculation>> {
+    pub async fn process_payroll(&self, pay_period_id: Uuid) -> PayrollResult<Vec<PayrollCalculation>> {
         info!("Processing payroll for pay period {}", pay_period_id);
         
         // Get all active employees
@@ -889,8 +913,8 @@ impl Agent for PayrollAgent {
 impl PayrollAgent {
     /// Process a calculate payroll task
     async fn process_calculate_payroll(&self, task: Task) -> Result<Task, anyhow::Error> {
-        self.status = AgentStatus::Busy;
-        
+        // Status tracking deferred - requires interior mutability
+
         let start_time = std::time::Instant::now();
         
         // In a real implementation, we would extract payroll calculation parameters from the task
@@ -913,9 +937,9 @@ impl PayrollAgent {
         );
         
         let processing_time = start_time.elapsed().as_millis() as f64;
-        
-        self.status = AgentStatus::Idle;
-        
+
+        // Status tracking deferred - requires interior mutability
+
         Ok(task.complete(result))
     }
 }
@@ -1026,8 +1050,10 @@ mod tests {
         let employee = processor.create_employee(employee).await.unwrap();
         
         // Get current pay period
-        let current_pay_period = processor.current_pay_period.lock().await;
-        let pay_period_id = current_pay_period.as_ref().map(|p| p.id).unwrap();
+        let pay_period_id = {
+            let current_pay_period = processor.current_pay_period.lock().await;
+            current_pay_period.as_ref().map(|p| p.id).unwrap()
+        };
         
         // Record time
         let time_entry = TimeEntry {

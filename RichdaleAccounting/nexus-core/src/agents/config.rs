@@ -6,6 +6,7 @@ use serde::{Serialize, Deserialize};
 use std::collections::HashMap;
 use std::path::Path;
 use config::{Config, File, Environment};
+use uuid::Uuid;
 use crate::agents::agent_types::{AgentType, AgentConfig};
 use crate::agents::error::AgentError;
 
@@ -134,8 +135,9 @@ impl AgentSystemConfig {
         let settings = Config::builder()
             .add_source(File::from(path.as_ref()))
             .add_source(Environment::with_prefix("AGENT").prefix_separator("_"))
-            .build()?;
-        
+            .build()
+            .map_err(|e| AgentError::InvalidConfiguration(e.to_string()))?;
+
         settings.try_deserialize().map_err(|e| AgentError::InvalidConfiguration(e.to_string()))
     }
 

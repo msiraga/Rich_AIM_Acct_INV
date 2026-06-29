@@ -3,7 +3,7 @@
 //! This module contains shared data models for the NexusLedger system.
 
 use serde::{Serialize, Deserialize};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc, Datelike};
 use uuid::Uuid;
 
 /// Date range for reporting and filtering
@@ -34,24 +34,28 @@ impl DateRange {
     /// Create a date range for today
     pub fn today() -> Self {
         let now = Utc::now();
-        let start = now.date_naive().and_hms_opt(0, 0, 0).unwrap();
-        let end = now.date_naive().and_hms_opt(23, 59, 59).unwrap();
+        let start = now.date_naive().and_hms_opt(0, 0, 0).unwrap().and_utc();
+        let end = now.date_naive().and_hms_opt(23, 59, 59).unwrap().and_utc();
         Self { start, end }
     }
 
     /// Create a date range for the current month
     pub fn current_month() -> Self {
         let now = Utc::now();
-        let start = now.date_naive().with_day(1).unwrap().and_hms_opt(0, 0, 0).unwrap();
-        let end = now.date_naive().with_day(now.day()).unwrap().and_hms_opt(23, 59, 59).unwrap();
+        let start = NaiveDate::from_ymd_opt(now.date_naive().year(), now.date_naive().month(), 1)
+            .unwrap().and_hms_opt(0, 0, 0).unwrap().and_utc();
+        let end = NaiveDate::from_ymd_opt(now.date_naive().year(), now.date_naive().month(), now.date_naive().day())
+            .unwrap().and_hms_opt(23, 59, 59).unwrap().and_utc();
         Self { start, end }
     }
 
     /// Create a date range for the current year
     pub fn current_year() -> Self {
         let now = Utc::now();
-        let start = now.date_naive().with_month(1).unwrap().with_day(1).unwrap().and_hms_opt(0, 0, 0).unwrap();
-        let end = now.date_naive().with_month(12).unwrap().with_day(31).unwrap().and_hms_opt(23, 59, 59).unwrap();
+        let start = NaiveDate::from_ymd_opt(now.date_naive().year(), 1, 1)
+            .unwrap().and_hms_opt(0, 0, 0).unwrap().and_utc();
+        let end = NaiveDate::from_ymd_opt(now.date_naive().year(), 12, 31)
+            .unwrap().and_hms_opt(23, 59, 59).unwrap().and_utc();
         Self { start, end }
     }
 

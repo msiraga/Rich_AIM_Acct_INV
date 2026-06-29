@@ -39,7 +39,7 @@ pub use utils::date_utils::{DateRange, DateError};
 pub use utils::file_utils::{FileError, FileProcessor};
 
 /// NexusLedger main struct that orchestrates all accounting operations
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct NexusLedger {
     pub orchestrator: AgentOrchestrator,
     pub ledger: Ledger,
@@ -76,9 +76,9 @@ impl NexusLedger {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_nexus_ledger_creation() {
+    #[tokio::test]
+    async fn test_nexus_ledger_creation() {
         let nexus = NexusLedger::new();
-        assert!(nexus.orchestrator.agents.is_empty());
+        assert!(nexus.orchestrator.agents.read().await.is_empty());
     }
 }

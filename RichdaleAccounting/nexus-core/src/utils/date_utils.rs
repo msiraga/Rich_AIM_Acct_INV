@@ -76,12 +76,12 @@ impl DateRange {
 
     /// Get the start as a datetime at midnight
     pub fn start_datetime(&self) -> DateTime<Utc> {
-        self.start.and_hms_opt(0, 0, 0).unwrap()
+        self.start.and_hms_opt(0, 0, 0).unwrap().and_utc()
     }
 
     /// Get the end as a datetime at midnight
     pub fn end_datetime(&self) -> DateTime<Utc> {
-        self.end.and_hms_opt(23, 59, 59).unwrap()
+        self.end.and_hms_opt(23, 59, 59).unwrap().and_utc()
     }
 }
 
@@ -113,18 +113,18 @@ pub enum DateError {
 
 impl DateError {
     /// Create a new invalid format error
-    pub fn invalid_format(msg: &str) -> Self {
-        Self::InvalidFormat(msg.to_string())
+    pub fn invalid_format(msg: String) -> Self {
+        Self::InvalidFormat(msg)
     }
 
     /// Create a new out of range error
-    pub fn out_of_range(msg: &str) -> Self {
-        Self::OutOfRange(msg.to_string())
+    pub fn out_of_range(msg: String) -> Self {
+        Self::OutOfRange(msg)
     }
 
     /// Create a new invalid range error
-    pub fn invalid_range(msg: &str) -> Self {
-        Self::InvalidRange(msg.to_string())
+    pub fn invalid_range(msg: String) -> Self {
+        Self::InvalidRange(msg)
     }
 }
 
@@ -154,7 +154,7 @@ impl DateUtils {
             return Ok(datetime.date_naive());
         }
         
-        Err(DateError::invalid_format(date_str))
+        Err(DateError::invalid_format(date_str.to_string()))
     }
 
     /// Format a date in ISO 8601 format
@@ -251,25 +251,20 @@ impl DateUtils {
 
     /// Add months to a date
     pub fn add_months(date: NaiveDate, months: i64) -> NaiveDate {
-        let mut result = date;
-        let mut remaining_months = months;
-        
-        while remaining_months != 0 {
-            let new_month = result.month() as i64 + remaining_months;
-            let new_year = result.year() + (new_month - 1) / 12;
-            let new_month = ((new_month - 1) % 12 + 1) as u32;
-            
-            result = result.with_year(new_year).unwrap().with_month(new_month).unwrap();
-            
-            // If the day doesn't exist in the new month, use the last day of the month
-            if result.day() > result.with_day(1).unwrap().with_month(new_month + 1).unwrap_or(result.with_year(new_year + 1).unwrap().with_month(1).unwrap()).pred_opt().unwrap_or(result).day() {
-                result = result.with_day(1).unwrap().with_month(new_month + 1).unwrap_or(result.with_year(new_year + 1).unwrap().with_month(1).unwrap()).pred_opt().unwrap_or(result);
-            }
-            
-            remaining_months = 0;
-        }
-        
-        result
+        let total_months = date.year() as i64 * 12 + (date.month() as i64 - 1) + months;
+        let new_year = total_months.div_euclid(12) as i32;
+        let new_month = (total_months.rem_euclid(12) + 1) as u32;
+        let day = date.day();
+
+        // Clamp to the last valid day of the target month
+        let last_day = NaiveDate::from_ymd_opt(
+            if new_month == 12 { new_year + 1 } else { new_year },
+            if new_month == 12 { 1 } else { new_month + 1 },
+            1,
+        ).unwrap().pred_opt().unwrap().day();
+
+        let clamped_day = day.min(last_day);
+        NaiveDate::from_ymd_opt(new_year, new_month, clamped_day).unwrap()
     }
 
     /// Subtract months from a date

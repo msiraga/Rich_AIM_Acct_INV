@@ -17,7 +17,7 @@ use crate::agents::config::AgentConfigManager;
 use crate::database::financial::Transaction;
 
 /// Agent Orchestrator - manages all agents and task distribution
-#[derive(Debug)]
+#[derive(Clone)]
 pub struct AgentOrchestrator {
     /// Map of agent ID to agent instance
     pub agents: Arc<RwLock<HashMap<Uuid, Arc<Mutex<dyn Agent>>>>>,
@@ -39,6 +39,15 @@ pub struct AgentOrchestrator {
     pub agent_statuses: Arc<RwLock<HashMap<Uuid, AgentStatusInfo>>>,
     /// Whether the orchestrator is running
     pub is_running: Arc<Mutex<bool>>,
+    /// Optional database connection for persistent storage
+    pub database: Option<crate::database::Database>,
+}
+
+impl std::fmt::Debug for AgentOrchestrator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AgentOrchestrator")
+            .finish_non_exhaustive()
+    }
 }
 
 impl Default for AgentOrchestrator {
@@ -61,23 +70,51 @@ impl AgentOrchestrator {
             config_manager: AgentConfigManager::new(),
             agent_statuses: Arc::new(RwLock::new(HashMap::new())),
             is_running: Arc::new(Mutex::new(false)),
+            database: None,
+        }
+    }
+
+    /// Create a new agent orchestrator with a database connection
+    pub fn with_database(database: crate::database::Database) -> Self {
+        Self {
+            agents: Arc::new(RwLock::new(HashMap::new())),
+            agents_by_type: Arc::new(RwLock::new(HashMap::new())),
+            task_queue: Arc::new(Mutex::new(VecDeque::new())),
+            in_progress_tasks: Arc::new(Mutex::new(HashMap::new())),
+            completed_tasks: Arc::new(Mutex::new(VecDeque::new())),
+            failed_tasks: Arc::new(Mutex::new(VecDeque::new())),
+            memory_manager: MemoryManager::new(),
+            config_manager: AgentConfigManager::new(),
+            agent_statuses: Arc::new(RwLock::new(HashMap::new())),
+            is_running: Arc::new(Mutex::new(false)),
+            database: Some(database),
         }
     }
 
     /// Initialize the orchestrator and all agents
     pub async fn initialize(&mut self) -> Result<(), anyhow::Error> {
         info!("Initializing Agent Orchestrator...");
-        
+
+        // Connect to database if configured
+        if let Some(ref db) = self.database {
+            info!("Connecting to database...");
+            db.connect().await
+                .map_err(|e| anyhow::anyhow!("Failed to connect to database: {}", e))?;
+            info!("Seeding default data...");
+            db.seed().await
+                .map_err(|e| anyhow::anyhow!("Failed to seed database: {}", e))?;
+        }
+
         // Create default agents for each type
         self.create_default_agents().await?;
-        
+
         // Initialize all agents
         self.initialize_all_agents().await?;
-        
+
         *self.is_running.lock().await = true;
-        
+
         info!("Agent Orchestrator initialized with {} agents", self.agents.read().await.len());
-        
+
         Ok(())
     }
 
@@ -141,79 +178,106 @@ impl AgentOrchestrator {
         // Create the appropriate agent based on type
         let agent: Arc<Mutex<dyn Agent>> = match config.agent_type {
             AgentType::LedgerAgent => {
+                let mut ledger = crate::accounting::ledger::Ledger::new();
+                if let Some(ref db) = self.database {
+                    ledger.db = Some(Arc::new(db.clone()));
+                }
                 Arc::new(Mutex::new(crate::accounting::ledger::LedgerAgent::new(
                     config.clone(),
-                    Arc::new(Mutex::new(None))
+                    ledger
                 )))
             }
             AgentType::ReconciliationAgent => {
                 Arc::new(Mutex::new(crate::accounting::reconciliation::ReconciliationAgent::new(
                     config.clone(),
-                    Arc::new(Mutex::new(None))
+                    crate::accounting::reconciliation::ReconciliationProcessor::new()
                 )))
             }
             AgentType::InvoiceAgent => {
+                // TODO: Replace with dedicated InvoiceAgent when implemented
+                let mut ledger = crate::accounting::ledger::Ledger::new();
+                if let Some(ref db) = self.database {
+                    ledger.db = Some(Arc::new(db.clone()));
+                }
                 Arc::new(Mutex::new(crate::accounting::ledger::LedgerAgent::new(
                     config.clone(),
-                    Arc::new(Mutex::new(None))
+                    ledger
                 )))
             }
             AgentType::PayrollAgent => {
                 Arc::new(Mutex::new(crate::accounting::payroll::PayrollAgent::new(
                     config.clone(),
-                    Arc::new(Mutex::new(None))
+                    crate::accounting::payroll::PayrollProcessor::new()
                 )))
             }
             AgentType::TaxAgent => {
                 Arc::new(Mutex::new(crate::accounting::tax::TaxAgent::new(
                     config.clone(),
-                    Arc::new(Mutex::new(None))
+                    crate::accounting::tax::TaxCalculator::new()
                 )))
             }
             AgentType::ReceiptAgent => {
+                let db_client = match &self.database {
+                    Some(db) => db.client(),
+                    None => Arc::new(Mutex::new(None)),
+                };
                 Arc::new(Mutex::new(crate::agents::document::DocumentAgent::new(
                     config.clone(),
-                    Arc::new(Mutex::new(None))
+                    db_client
                 )))
             }
             AgentType::DocumentAgent => {
+                let db_client = match &self.database {
+                    Some(db) => db.client(),
+                    None => Arc::new(Mutex::new(None)),
+                };
                 Arc::new(Mutex::new(crate::agents::document::DocumentAgent::new(
                     config.clone(),
-                    Arc::new(Mutex::new(None))
+                    db_client
                 )))
             }
             AgentType::AuditAgent => {
+                let audit_repo: Arc<dyn crate::database::audit::AuditRepository> = match &self.database {
+                    Some(db) => Arc::new(crate::database::audit::SurrealAuditRepository::new(db.client())),
+                    None => Arc::new(crate::database::audit::MemoryAuditRepository::new()),
+                };
                 Arc::new(Mutex::new(crate::audit::AuditAgent::new(
                     config.clone(),
-                    Arc::new(Mutex::new(None))
+                    audit_repo
                 )))
             }
             AgentType::ReportingAgent => {
+                // TODO: Replace with dedicated ReportingAgent when implemented
+                let mut ledger = crate::accounting::ledger::Ledger::new();
+                if let Some(ref db) = self.database {
+                    ledger.db = Some(Arc::new(db.clone()));
+                }
                 Arc::new(Mutex::new(crate::accounting::ledger::LedgerAgent::new(
                     config.clone(),
-                    Arc::new(Mutex::new(None))
+                    ledger
                 )))
             }
         };
         
         let agent_id = config.id;
-        
+        let agent_type = config.agent_type.clone();
+
         // Add to agents map
         self.agents.write().await.insert(agent_id, agent.clone());
-        
+
         // Add to agents_by_type map
         let mut agents_by_type = self.agents_by_type.write().await;
-        agents_by_type.entry(config.agent_type.clone())
+        agents_by_type.entry(agent_type.clone())
             .or_insert_with(Vec::new)
             .push(agent_id);
-        
+
         // Add to config manager
         self.config_manager.add_agent_config(config);
-        
+
         // Initialize status tracking
         let mut statuses = self.agent_statuses.write().await;
-        statuses.insert(agent_id, AgentStatusInfo::new(agent_id, config.agent_type));
-        
+        statuses.insert(agent_id, AgentStatusInfo::new(agent_id, agent_type));
+
         info!("Agent {} added successfully", agent_id);
         
         Ok(agent_id)
@@ -247,11 +311,14 @@ impl AgentOrchestrator {
     /// Submit a task to the orchestrator
     pub async fn submit_task(&self, task: Task) -> Result<Uuid, anyhow::Error> {
         debug!("Submitting task: {} ({:?})", task.id, task.task_type);
-        
+
+        // Save task ID before moving task into the queue
+        let task_id = task.id;
+
         // Add task to queue
         self.task_queue.lock().await.push_back(task);
-        
-        Ok(task.id)
+
+        Ok(task_id)
     }
 
     /// Process a transaction through the appropriate agent
@@ -383,9 +450,12 @@ impl AgentOrchestrator {
             }
             
             drop(statuses); // Release the lock
-            
+
+            // Clone task before moving into process_task to retain access in error path
+            let task_clone = task.clone();
+
             // Process the task (in a real implementation, this would be async)
-            match agent_guard.process_task(task).await {
+            match agent_guard.process_task(task_clone).await {
                 Ok(completed_task) => {
                     self.handle_completed_task(completed_task, agent_id).await?;
                 }
@@ -423,12 +493,15 @@ impl AgentOrchestrator {
     /// Handle a failed task
     async fn handle_failed_task(&self, mut task: Task, agent_id: Uuid, error: String) -> Result<(), anyhow::Error> {
         error!("Task {} failed on agent {}: {}", task.id, agent_id, error);
-        
+
+        // Clone error string before moving into TaskStatus::Failed
+        let error_clone = error.clone();
+
         // Remove from in-progress tasks
         self.in_progress_tasks.lock().await.remove(&task.id);
-        
+
         // Update task status
-        task.status = TaskStatus::Failed(error);
+        task.status = TaskStatus::Failed(error_clone);
         
         // Check if we should retry
         if task.can_retry() {
@@ -539,7 +612,7 @@ impl Agent for AgentOrchestrator {
         self.stop().await
     }
 
-    async fn process_task(&self, task: Task) -> Result<Task, anyhow::Error> {
+    async fn process_task(&self, _task: Task) -> Result<Task, anyhow::Error> {
         // Orchestrator doesn't process tasks directly, it delegates to agents
         Err(AgentError::TaskProcessingFailed(
             "Agent Orchestrator does not process tasks directly".to_string()

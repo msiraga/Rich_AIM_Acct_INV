@@ -3,7 +3,6 @@
 //! Defines error types for the agent system.
 
 use thiserror::Error;
-use std::fmt;
 
 /// Error types for the agent system
 #[derive(Debug, Error)]
@@ -87,11 +86,7 @@ impl AgentError {
     }
 }
 
-impl fmt::Display for AgentError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.message())
-    }
-}
+// Note: Display is automatically implemented by thiserror::Error derive macro
 
 /// Result type for agent operations
 pub type AgentResult<T> = Result<T, AgentError>;

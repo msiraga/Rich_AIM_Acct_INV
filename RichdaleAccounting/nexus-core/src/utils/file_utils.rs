@@ -4,11 +4,12 @@
 
 use std::path::{Path, PathBuf};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write, Seek, SeekFrom};
+use std::io::{self, Write, Seek, SeekFrom};
 use std::fmt;
 use thiserror::Error;
 use base64::{Engine as _, engine::general_purpose};
 use path_absolutize::Absolutize;
+use uuid::Uuid;
 
 /// File error types
 #[derive(Debug, Error)]
@@ -105,6 +106,7 @@ impl FileProcessor {
     pub fn absolutize<P: AsRef<Path>>(path: P) -> FileResult<PathBuf> {
         path.as_ref()
             .absolutize()
+            .map(|p| p.to_path_buf())
             .map_err(|e| FileError::InvalidPath(e.to_string()))
     }
 
@@ -328,7 +330,7 @@ impl FileProcessor {
         F: Fn(&Path) -> bool,
     {
         let files = Self::list_files(path)?;
-        Ok(files.into_iter().filter(filter).collect())
+        Ok(files.into_iter().filter(|p| filter(p.as_path())).collect())
     }
 
     /// List only files (not directories)

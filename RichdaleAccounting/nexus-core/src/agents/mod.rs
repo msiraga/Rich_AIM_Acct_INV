@@ -41,7 +41,7 @@ pub async fn initialize_agents() -> Result<AgentOrchestrator, anyhow::Error> {
 /// Create a default agent configuration for testing
 pub fn create_test_agent_config(agent_type: AgentType) -> AgentConfig {
     AgentConfig::new(
-        agent_type,
+        agent_type.clone(),
         &format!("Test {:?} Agent", agent_type),
         &format!("Test agent for {:?}", agent_type)
     )

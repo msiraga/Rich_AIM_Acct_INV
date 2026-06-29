@@ -39,12 +39,12 @@ pub trait DocumentRepository: Send + Sync {
 #[derive(Debug, Clone)]
 pub struct SurrealDocumentRepository {
     /// Database connection
-    pub db: Arc<Mutex<Option<surrealdb::Surreal<surrealdb::engine::remote::ws::Client>>>>,
+    pub db: Arc<Mutex<Option<surrealdb::Surreal<surrealdb::engine::local::Db>>>>,
 }
 
 impl SurrealDocumentRepository {
     /// Create a new SurrealDB document repository
-    pub fn new(db: Arc<Mutex<Option<surrealdb::Surreal<surrealdb::engine::remote::ws::Client>>>>) -> Self {
+    pub fn new(db: Arc<Mutex<Option<surrealdb::Surreal<surrealdb::engine::local::Db>>>>) -> Self {
         Self { db }
     }
 }
@@ -52,141 +52,189 @@ impl SurrealDocumentRepository {
 #[async_trait]
 impl DocumentRepository for SurrealDocumentRepository {
     async fn save(&self, document: &Document) -> DatabaseResult<Document> {
-        let client = self.db.lock().await;
-        let client = client.as_ref().ok_or(DatabaseError::NotInitialized)?;
+        let guard = self.db.lock().await;
+        let client = guard.as_ref().ok_or(DatabaseError::NotInitialized)?;
 
-        // Convert document to a format that SurrealDB can store
-        let doc_data = serde_json::json!({
-            "id": document.id,
-            "name": document.name,
-            "document_type": document.document_type.to_str(),
-            "content": base64::encode(&document.content),
-            "metadata": document.metadata,
-            "created_at": document.created_at.to_rfc3339(),
-            "updated_at": document.updated_at.to_rfc3339(),
-        });
+        let content_b64 = base64::encode(&document.content);
+        let mut response = client.query(
+            "CREATE document SET \
+             name = $name, \
+             document_type = $doc_type, \
+             content = $content, \
+             metadata = $metadata, \
+             created_at = $created_at, \
+             updated_at = $updated_at"
+        )
+        .bind(("name", document.name.clone()))
+        .bind(("doc_type", document.document_type.to_str().to_string()))
+        .bind(("content", content_b64))
+        .bind(("metadata", document.metadata.to_string()))
+        .bind(("created_at", document.created_at.to_rfc3339()))
+        .bind(("updated_at", document.updated_at.to_rfc3339()))
+        .await
+        .map_err(|e| DatabaseError::QueryError(e.to_string()))?;
 
-        // Insert or update the document
-        let query = format!(
-            "INSERT INTO document CONTENT {};",
-            serde_json::to_string(&doc_data).map_err(|e| DatabaseError::SerializationError(e.to_string()))?
-        );
-
-        let _ = client.query(&query)
-            .await
+        let results: Vec<serde_json::Value> = response.take(0)
             .map_err(|e| DatabaseError::QueryError(e.to_string()))?;
 
-        Ok(document.clone())
+        if let Some(val) = results.into_iter().next() {
+            self.parse_document(val)
+        } else {
+            Ok(document.clone())
+        }
     }
 
     async fn find_by_id(&self, id: &str) -> DatabaseResult<Option<Document>> {
-        let client = self.db.lock().await;
-        let client = client.as_ref().ok_or(DatabaseError::NotInitialized)?;
+        let guard = self.db.lock().await;
+        let client = guard.as_ref().ok_or(DatabaseError::NotInitialized)?;
 
-        let query = format!("SELECT * FROM document WHERE id = '{}';", id);
-        
-        let result: Option<serde_json::Value> = client.query(&query)
-            .await
+        let mut response = client.query(
+            "SELECT * FROM document WHERE id = $id"
+        )
+        .bind(("id", id.to_string()))
+        .await
+        .map_err(|e| DatabaseError::QueryError(e.to_string()))?;
+
+        let results: Vec<serde_json::Value> = response.take(0)
             .map_err(|e| DatabaseError::QueryError(e.to_string()))?;
 
-        match result {
-            Some(value) => {
-                let doc = self.parse_document(value)?;
-                Ok(Some(doc))
-            }
+        match results.into_iter().next() {
+            Some(val) => Ok(Some(self.parse_document(val)?)),
             None => Ok(None),
         }
     }
 
     async fn find_by_type(&self, doc_type: DocumentType) -> DatabaseResult<Vec<Document>> {
-        let client = self.db.lock().await;
-        let client = client.as_ref().ok_or(DatabaseError::NotInitialized)?;
+        let guard = self.db.lock().await;
+        let client = guard.as_ref().ok_or(DatabaseError::NotInitialized)?;
 
-        let type_str = doc_type.to_str();
-        let query = format!("SELECT * FROM document WHERE document_type = '{}';", type_str);
-        
-        let result: Vec<serde_json::Value> = client.query(&query)
-            .await
+        let mut response = client.query(
+            "SELECT * FROM document WHERE document_type = $doc_type"
+        )
+        .bind(("doc_type", doc_type.to_str().to_string()))
+        .await
+        .map_err(|e| DatabaseError::QueryError(e.to_string()))?;
+
+        let results: Vec<serde_json::Value> = response.take(0)
             .map_err(|e| DatabaseError::QueryError(e.to_string()))?;
 
-        let documents = result.into_iter()
-            .filter_map(|v| self.parse_document(v).ok())
-            .collect();
-
-        Ok(documents)
+        results.into_iter()
+            .map(|val| self.parse_document(val))
+            .collect()
     }
 
     async fn find_by_name(&self, name: &str) -> DatabaseResult<Vec<Document>> {
-        let client = self.db.lock().await;
-        let client = client.as_ref().ok_or(DatabaseError::NotInitialized)?;
+        let guard = self.db.lock().await;
+        let client = guard.as_ref().ok_or(DatabaseError::NotInitialized)?;
 
-        let query = format!("SELECT * FROM document WHERE name CONTAINS '{}';", name);
-        
-        let result: Vec<serde_json::Value> = client.query(&query)
-            .await
+        let mut response = client.query(
+            "SELECT * FROM document WHERE string::contains(name, $name)"
+        )
+        .bind(("name", name.to_string()))
+        .await
+        .map_err(|e| DatabaseError::QueryError(e.to_string()))?;
+
+        let results: Vec<serde_json::Value> = response.take(0)
             .map_err(|e| DatabaseError::QueryError(e.to_string()))?;
 
-        let documents = result.into_iter()
-            .filter_map(|v| self.parse_document(v).ok())
-            .collect();
-
-        Ok(documents)
+        results.into_iter()
+            .map(|val| self.parse_document(val))
+            .collect()
     }
 
     async fn delete(&self, id: &str) -> DatabaseResult<bool> {
-        let client = self.db.lock().await;
-        let client = client.as_ref().ok_or(DatabaseError::NotInitialized)?;
+        let guard = self.db.lock().await;
+        let client = guard.as_ref().ok_or(DatabaseError::NotInitialized)?;
 
-        let query = format!("DELETE FROM document WHERE id = '{}';", id);
-        
-        let result: Option<serde_json::Value> = client.query(&query)
-            .await
+        // First check if the document exists
+        let mut check = client.query(
+            "SELECT * FROM document WHERE id = $id"
+        )
+        .bind(("id", id.to_string()))
+        .await
+        .map_err(|e| DatabaseError::QueryError(e.to_string()))?;
+
+        let existing: Vec<serde_json::Value> = check.take(0)
             .map_err(|e| DatabaseError::QueryError(e.to_string()))?;
 
-        Ok(result.is_some())
+        if existing.is_empty() {
+            return Ok(false);
+        }
+
+        client.query(
+            "DELETE FROM document WHERE id = $id"
+        )
+        .bind(("id", id.to_string()))
+        .await
+        .map_err(|e| DatabaseError::QueryError(e.to_string()))?;
+
+        Ok(true)
     }
 
     async fn list_all(&self) -> DatabaseResult<Vec<Document>> {
-        let client = self.db.lock().await;
-        let client = client.as_ref().ok_or(DatabaseError::NotInitialized)?;
+        let guard = self.db.lock().await;
+        let client = guard.as_ref().ok_or(DatabaseError::NotInitialized)?;
 
-        let query = "SELECT * FROM document;";
-        
-        let result: Vec<serde_json::Value> = client.query(query)
-            .await
+        let mut response = client.query(
+            "SELECT * FROM document"
+        )
+        .await
+        .map_err(|e| DatabaseError::QueryError(e.to_string()))?;
+
+        let results: Vec<serde_json::Value> = response.take(0)
             .map_err(|e| DatabaseError::QueryError(e.to_string()))?;
 
-        let documents = result.into_iter()
-            .filter_map(|v| self.parse_document(v).ok())
-            .collect();
-
-        Ok(documents)
+        results.into_iter()
+            .map(|val| self.parse_document(val))
+            .collect()
     }
 
     async fn update(&self, id: &str, document: &Document) -> DatabaseResult<Document> {
-        let client = self.db.lock().await;
-        let client = client.as_ref().ok_or(DatabaseError::NotInitialized)?;
+        let guard = self.db.lock().await;
+        let client = guard.as_ref().ok_or(DatabaseError::NotInitialized)?;
 
-        let doc_data = serde_json::json!({
-            "id": id,
-            "name": document.name,
-            "document_type": document.document_type.to_str(),
-            "content": base64::encode(&document.content),
-            "metadata": document.metadata,
-            "updated_at": document.updated_at.to_rfc3339(),
-        });
+        // Verify the document exists first
+        let mut check = client.query(
+            "SELECT * FROM document WHERE id = $id"
+        )
+        .bind(("id", id.to_string()))
+        .await
+        .map_err(|e| DatabaseError::QueryError(e.to_string()))?;
 
-        let query = format!(
-            "UPDATE document SET {} WHERE id = '{}';",
-            serde_json::to_string(&doc_data).map_err(|e| DatabaseError::SerializationError(e.to_string()))?,
-            id
-        );
-
-        let _ = client.query(&query)
-            .await
+        let existing: Vec<serde_json::Value> = check.take(0)
             .map_err(|e| DatabaseError::QueryError(e.to_string()))?;
 
-        Ok(document.clone())
+        if existing.is_empty() {
+            return Err(DatabaseError::NotFound(format!("Document with id {} not found", id)));
+        }
+
+        let content_b64 = base64::encode(&document.content);
+        let mut response = client.query(
+            "UPDATE document SET \
+             name = $name, \
+             document_type = $doc_type, \
+             content = $content, \
+             metadata = $metadata, \
+             updated_at = $updated_at \
+             WHERE id = $id"
+        )
+        .bind(("name", document.name.clone()))
+        .bind(("doc_type", document.document_type.to_str().to_string()))
+        .bind(("content", content_b64))
+        .bind(("metadata", document.metadata.to_string()))
+        .bind(("updated_at", document.updated_at.to_rfc3339()))
+        .bind(("id", id.to_string()))
+        .await
+        .map_err(|e| DatabaseError::QueryError(e.to_string()))?;
+
+        let results: Vec<serde_json::Value> = response.take(0)
+            .map_err(|e| DatabaseError::QueryError(e.to_string()))?;
+
+        if let Some(val) = results.into_iter().next() {
+            self.parse_document(val)
+        } else {
+            Ok(document.clone())
+        }
     }
 }
 
@@ -200,8 +248,8 @@ impl SurrealDocumentRepository {
         let doc_type = obj.get("document_type").and_then(|v| v.as_str()).map(|s| DocumentType::from_str(s)).unwrap_or(DocumentType::Other);
         let content = obj.get("content").and_then(|v| v.as_str()).map(|s| base64::decode(s).unwrap_or_default()).unwrap_or_default();
         let metadata = obj.get("metadata").cloned().unwrap_or(serde_json::json!({}));
-        let created_at = obj.get("created_at").and_then(|v| v.as_str()).and_then(|s| DateTime::parse_from_rfc3339(s).ok()).unwrap_or_else(|| Utc::now());
-        let updated_at = obj.get("updated_at").and_then(|v| v.as_str()).and_then(|s| DateTime::parse_from_rfc3339(s).ok()).unwrap_or_else(|| Utc::now());
+        let created_at = obj.get("created_at").and_then(|v| v.as_str()).and_then(|s| DateTime::parse_from_rfc3339(s).ok()).map(|dt| dt.with_timezone(&Utc)).unwrap_or_else(|| Utc::now());
+        let updated_at = obj.get("updated_at").and_then(|v| v.as_str()).and_then(|s| DateTime::parse_from_rfc3339(s).ok()).map(|dt| dt.with_timezone(&Utc)).unwrap_or_else(|| Utc::now());
 
         Ok(Document {
             id,

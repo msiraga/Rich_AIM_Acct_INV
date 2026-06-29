@@ -39,12 +39,12 @@ pub trait AuditRepository: Send + Sync {
 #[derive(Debug, Clone)]
 pub struct SurrealAuditRepository {
     /// Database connection
-    pub db: Arc<Mutex<Option<surrealdb::Surreal<surrealdb::engine::remote::ws::Client>>>>,
+    pub db: Arc<Mutex<Option<surrealdb::Surreal<surrealdb::engine::local::Db>>>>,
 }
 
 impl SurrealAuditRepository {
     /// Create a new SurrealDB audit repository
-    pub fn new(db: Arc<Mutex<Option<surrealdb::Surreal<surrealdb::engine::remote::ws::Client>>>>) -> Self {
+    pub fn new(db: Arc<Mutex<Option<surrealdb::Surreal<surrealdb::engine::local::Db>>>>) -> Self {
         Self { db }
     }
 }
@@ -52,142 +52,179 @@ impl SurrealAuditRepository {
 #[async_trait]
 impl AuditRepository for SurrealAuditRepository {
     async fn log(&self, audit_log: AuditLog) -> DatabaseResult<AuditLog> {
-        let client = self.db.lock().await;
-        let client = client.as_ref().ok_or(DatabaseError::NotInitialized)?;
+        let guard = self.db.lock().await;
+        let client = guard.as_ref().ok_or(DatabaseError::NotInitialized)?;
 
-        let log_data = serde_json::json!({
-            "id": audit_log.id.to_string(),
-            "user_id": audit_log.user_id.map(|u| u.to_string()),
-            "action": self.action_to_string(&audit_log.action),
-            "entity_type": audit_log.entity_type,
-            "entity_id": audit_log.entity_id,
-            "old_values": audit_log.old_values,
-            "new_values": audit_log.new_values,
-            "timestamp": audit_log.timestamp.to_rfc3339(),
-            "ip_address": audit_log.ip_address,
-            "user_agent": audit_log.user_agent,
-            "success": audit_log.success,
-            "error_message": audit_log.error_message,
-        });
+        let user_id_str = audit_log.user_id.map(|id| id.to_string());
+        let action_str = self.action_to_string(&audit_log.action);
+        let old_values_str = audit_log.old_values.as_ref().map(|v| v.to_string());
+        let new_values_str = audit_log.new_values.as_ref().map(|v| v.to_string());
 
-        let query = format!(
-            "INSERT INTO audit_log CONTENT {};",
-            serde_json::to_string(&log_data).map_err(|e| DatabaseError::SerializationError(e.to_string()))?
-        );
+        let mut response = client.query(
+            "CREATE audit_log SET \
+             user_id = $user_id, \
+             action = $action, \
+             entity_type = $entity_type, \
+             entity_id = $entity_id, \
+             old_values = $old_values, \
+             new_values = $new_values, \
+             timestamp = $timestamp, \
+             ip_address = $ip_address, \
+             user_agent = $user_agent, \
+             success = $success, \
+             error_message = $error_message"
+        )
+        .bind(("user_id", user_id_str))
+        .bind(("action", action_str))
+        .bind(("entity_type", audit_log.entity_type.clone()))
+        .bind(("entity_id", audit_log.entity_id.clone()))
+        .bind(("old_values", old_values_str))
+        .bind(("new_values", new_values_str))
+        .bind(("timestamp", audit_log.timestamp.to_rfc3339()))
+        .bind(("ip_address", audit_log.ip_address.clone()))
+        .bind(("user_agent", audit_log.user_agent.clone()))
+        .bind(("success", audit_log.success))
+        .bind(("error_message", audit_log.error_message.clone()))
+        .await
+        .map_err(|e| DatabaseError::QueryError(e.to_string()))?;
 
-        let _ = client.query(&query)
-            .await
+        let results: Vec<serde_json::Value> = response.take(0)
             .map_err(|e| DatabaseError::QueryError(e.to_string()))?;
 
-        Ok(audit_log)
+        if let Some(val) = results.into_iter().next() {
+            self.parse_audit_log(val)
+        } else {
+            Ok(audit_log)
+        }
     }
 
     async fn find_by_user(&self, user_id: Uuid) -> DatabaseResult<Vec<AuditLog>> {
-        let client = self.db.lock().await;
-        let client = client.as_ref().ok_or(DatabaseError::NotInitialized)?;
+        let guard = self.db.lock().await;
+        let client = guard.as_ref().ok_or(DatabaseError::NotInitialized)?;
 
-        let query = format!("SELECT * FROM audit_log WHERE user_id = '{}';", user_id);
-        
-        let result: Vec<serde_json::Value> = client.query(&query)
-            .await
+        let mut response = client.query(
+            "SELECT * FROM audit_log WHERE user_id = $user_id ORDER BY timestamp DESC"
+        )
+        .bind(("user_id", user_id.to_string()))
+        .await
+        .map_err(|e| DatabaseError::QueryError(e.to_string()))?;
+
+        let results: Vec<serde_json::Value> = response.take(0)
             .map_err(|e| DatabaseError::QueryError(e.to_string()))?;
 
-        let logs = result.into_iter()
-            .filter_map(|v| self.parse_audit_log(v).ok())
-            .collect();
-
-        Ok(logs)
+        results.into_iter()
+            .map(|val| self.parse_audit_log(val))
+            .collect()
     }
 
     async fn find_by_entity(&self, entity_type: &str, entity_id: &str) -> DatabaseResult<Vec<AuditLog>> {
-        let client = self.db.lock().await;
-        let client = client.as_ref().ok_or(DatabaseError::NotInitialized)?;
+        let guard = self.db.lock().await;
+        let client = guard.as_ref().ok_or(DatabaseError::NotInitialized)?;
 
-        let query = format!(
-            "SELECT * FROM audit_log WHERE entity_type = '{}' AND entity_id = '{}';",
-            entity_type, entity_id
-        );
-        
-        let result: Vec<serde_json::Value> = client.query(&query)
-            .await
+        let mut response = client.query(
+            "SELECT * FROM audit_log WHERE entity_type = $entity_type AND entity_id = $entity_id ORDER BY timestamp DESC"
+        )
+        .bind(("entity_type", entity_type.to_string()))
+        .bind(("entity_id", entity_id.to_string()))
+        .await
+        .map_err(|e| DatabaseError::QueryError(e.to_string()))?;
+
+        let results: Vec<serde_json::Value> = response.take(0)
             .map_err(|e| DatabaseError::QueryError(e.to_string()))?;
 
-        let logs = result.into_iter()
-            .filter_map(|v| self.parse_audit_log(v).ok())
-            .collect();
-
-        Ok(logs)
+        results.into_iter()
+            .map(|val| self.parse_audit_log(val))
+            .collect()
     }
 
     async fn find_by_action(&self, action: AuditAction) -> DatabaseResult<Vec<AuditLog>> {
-        let client = self.db.lock().await;
-        let client = client.as_ref().ok_or(DatabaseError::NotInitialized)?;
+        let guard = self.db.lock().await;
+        let client = guard.as_ref().ok_or(DatabaseError::NotInitialized)?;
 
         let action_str = self.action_to_string(&action);
-        let query = format!("SELECT * FROM audit_log WHERE action = '{}';", action_str);
-        
-        let result: Vec<serde_json::Value> = client.query(&query)
-            .await
+
+        let mut response = client.query(
+            "SELECT * FROM audit_log WHERE action = $action ORDER BY timestamp DESC"
+        )
+        .bind(("action", action_str))
+        .await
+        .map_err(|e| DatabaseError::QueryError(e.to_string()))?;
+
+        let results: Vec<serde_json::Value> = response.take(0)
             .map_err(|e| DatabaseError::QueryError(e.to_string()))?;
 
-        let logs = result.into_iter()
-            .filter_map(|v| self.parse_audit_log(v).ok())
-            .collect();
-
-        Ok(logs)
+        results.into_iter()
+            .map(|val| self.parse_audit_log(val))
+            .collect()
     }
 
     async fn find_by_date_range(&self, start: DateTime<Utc>, end: DateTime<Utc>) -> DatabaseResult<Vec<AuditLog>> {
-        let client = self.db.lock().await;
-        let client = client.as_ref().ok_or(DatabaseError::NotInitialized)?;
+        let guard = self.db.lock().await;
+        let client = guard.as_ref().ok_or(DatabaseError::NotInitialized)?;
 
-        let start_str = start.to_rfc3339();
-        let end_str = end.to_rfc3339();
-        let query = format!(
-            "SELECT * FROM audit_log WHERE timestamp >= '{}' AND timestamp <= '{}';",
-            start_str, end_str
-        );
-        
-        let result: Vec<serde_json::Value> = client.query(&query)
-            .await
+        let mut response = client.query(
+            "SELECT * FROM audit_log WHERE timestamp >= $start AND timestamp <= $end ORDER BY timestamp DESC"
+        )
+        .bind(("start", start.to_rfc3339()))
+        .bind(("end", end.to_rfc3339()))
+        .await
+        .map_err(|e| DatabaseError::QueryError(e.to_string()))?;
+
+        let results: Vec<serde_json::Value> = response.take(0)
             .map_err(|e| DatabaseError::QueryError(e.to_string()))?;
 
-        let logs = result.into_iter()
-            .filter_map(|v| self.parse_audit_log(v).ok())
-            .collect();
-
-        Ok(logs)
+        results.into_iter()
+            .map(|val| self.parse_audit_log(val))
+            .collect()
     }
 
     async fn list_all(&self) -> DatabaseResult<Vec<AuditLog>> {
-        let client = self.db.lock().await;
-        let client = client.as_ref().ok_or(DatabaseError::NotInitialized)?;
+        let guard = self.db.lock().await;
+        let client = guard.as_ref().ok_or(DatabaseError::NotInitialized)?;
 
-        let query = "SELECT * FROM audit_log ORDER BY timestamp DESC;";
-        
-        let result: Vec<serde_json::Value> = client.query(query)
-            .await
+        let mut response = client.query(
+            "SELECT * FROM audit_log ORDER BY timestamp DESC"
+        )
+        .await
+        .map_err(|e| DatabaseError::QueryError(e.to_string()))?;
+
+        let results: Vec<serde_json::Value> = response.take(0)
             .map_err(|e| DatabaseError::QueryError(e.to_string()))?;
 
-        let logs = result.into_iter()
-            .filter_map(|v| self.parse_audit_log(v).ok())
-            .collect();
-
-        Ok(logs)
+        results.into_iter()
+            .map(|val| self.parse_audit_log(val))
+            .collect()
     }
 
     async fn delete_older_than(&self, date: DateTime<Utc>) -> DatabaseResult<u64> {
-        let client = self.db.lock().await;
-        let client = client.as_ref().ok_or(DatabaseError::NotInitialized)?;
+        let guard = self.db.lock().await;
+        let client = guard.as_ref().ok_or(DatabaseError::NotInitialized)?;
 
-        let date_str = date.to_rfc3339();
-        let query = format!("DELETE FROM audit_log WHERE timestamp < '{}';", date_str);
-        
-        let result: Vec<serde_json::Value> = client.query(&query)
-            .await
+        // Count the records that will be deleted
+        let mut count_response = client.query(
+            "SELECT count() FROM audit_log WHERE timestamp < $date GROUP ALL"
+        )
+        .bind(("date", date.to_rfc3339()))
+        .await
+        .map_err(|e| DatabaseError::QueryError(e.to_string()))?;
+
+        let count_results: Vec<serde_json::Value> = count_response.take(0)
             .map_err(|e| DatabaseError::QueryError(e.to_string()))?;
 
-        Ok(result.len() as u64)
+        let count = count_results.first()
+            .and_then(|v| v.get("count"))
+            .and_then(|c| c.as_u64())
+            .unwrap_or(0);
+
+        // Delete the old records
+        client.query(
+            "DELETE FROM audit_log WHERE timestamp < $date"
+        )
+        .bind(("date", date.to_rfc3339()))
+        .await
+        .map_err(|e| DatabaseError::QueryError(e.to_string()))?;
+
+        Ok(count)
     }
 }
 
@@ -229,7 +266,7 @@ impl SurrealAuditRepository {
         let entity_id = obj.get("entity_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let old_values = obj.get("old_values").cloned();
         let new_values = obj.get("new_values").cloned();
-        let timestamp = obj.get("timestamp").and_then(|v| v.as_str()).and_then(|s| DateTime::parse_from_rfc3339(s).ok()).unwrap_or_else(|| Utc::now());
+        let timestamp = obj.get("timestamp").and_then(|v| v.as_str()).and_then(|s| DateTime::parse_from_rfc3339(s).ok()).map(|dt| dt.with_timezone(&Utc)).unwrap_or_else(|| Utc::now());
         let ip_address = obj.get("ip_address").and_then(|v| v.as_str()).map(String::from);
         let user_agent = obj.get("user_agent").and_then(|v| v.as_str()).map(String::from);
         let success = obj.get("success").and_then(|v| v.as_bool()).unwrap_or(true);
@@ -314,10 +351,16 @@ impl AuditRepository for MemoryAuditRepository {
 }
 
 /// Audit logger for convenient logging
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AuditLogger {
     /// Audit repository
     pub repository: Arc<dyn AuditRepository>,
+}
+
+impl std::fmt::Debug for AuditLogger {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "AuditLogger {{ repository: <dyn AuditRepository> }}")
+    }
 }
 
 impl AuditLogger {
@@ -329,6 +372,7 @@ impl AuditLogger {
     /// Log a create action
     pub async fn log_create(&self, user_id: Option<Uuid>, entity_type: &str, entity_id: &str, new_values: serde_json::Value) -> DatabaseResult<()> {
         let log = AuditLog {
+            id: Uuid::new_v4(),
             user_id,
             action: AuditAction::Create,
             entity_type: entity_type.to_string(),
@@ -349,6 +393,7 @@ impl AuditLogger {
     /// Log an update action
     pub async fn log_update(&self, user_id: Option<Uuid>, entity_type: &str, entity_id: &str, old_values: serde_json::Value, new_values: serde_json::Value) -> DatabaseResult<()> {
         let log = AuditLog {
+            id: Uuid::new_v4(),
             user_id,
             action: AuditAction::Update,
             entity_type: entity_type.to_string(),
@@ -369,6 +414,7 @@ impl AuditLogger {
     /// Log a delete action
     pub async fn log_delete(&self, user_id: Option<Uuid>, entity_type: &str, entity_id: &str, old_values: serde_json::Value) -> DatabaseResult<()> {
         let log = AuditLog {
+            id: Uuid::new_v4(),
             user_id,
             action: AuditAction::Delete,
             entity_type: entity_type.to_string(),
@@ -389,6 +435,7 @@ impl AuditLogger {
     /// Log an error
     pub async fn log_error(&self, user_id: Option<Uuid>, entity_type: &str, entity_id: &str, action: AuditAction, error: &str) -> DatabaseResult<()> {
         let log = AuditLog {
+            id: Uuid::new_v4(),
             user_id,
             action,
             entity_type: entity_type.to_string(),
@@ -448,7 +495,7 @@ mod tests {
     #[tokio::test]
     async fn test_audit_logger() {
         let repo = Arc::new(MemoryAuditRepository::new());
-        let logger = AuditLogger::new(repo);
+        let logger = AuditLogger::new(repo.clone());
         
         let user_id = Uuid::new_v4();
         let new_values = serde_json::json!({"name": "Test User", "email": "test@example.com"});
@@ -458,8 +505,8 @@ mod tests {
         
         // Log update
         let old_values = serde_json::json!({"name": "Test User", "email": "old@example.com"});
-        logger.log_update(Some(user_id), "user", "123", old_values, new_values).await.unwrap();
-        
+        logger.log_update(Some(user_id), "user", "123", old_values, new_values.clone()).await.unwrap();
+
         // Log delete
         logger.log_delete(Some(user_id), "user", "123", new_values).await.unwrap();
         

@@ -30,7 +30,7 @@ async fn main() -> Result<(), anyhow::Error> {
     nexus.initialize().await?;
     
     info!("NexusLedger initialized successfully!");
-    info!("Agents loaded: {}", nexus.orchestrator.agents.len());
+    info!("Agents loaded: {}", nexus.orchestrator.agents.read().await.len());
 
     // Start the agent orchestrator
     let orchestrator_arc = Arc::new(Mutex::new(nexus.orchestrator));

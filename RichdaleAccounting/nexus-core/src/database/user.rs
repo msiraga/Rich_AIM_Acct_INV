@@ -54,12 +54,12 @@ pub trait UserRepository: Send + Sync {
 #[derive(Debug, Clone)]
 pub struct SurrealUserRepository {
     /// Database connection
-    pub db: Arc<Mutex<Option<surrealdb::Surreal<surrealdb::engine::remote::ws::Client>>>>,
+    pub db: Arc<Mutex<Option<surrealdb::Surreal<surrealdb::engine::local::Db>>>>,
 }
 
 impl SurrealUserRepository {
     /// Create a new SurrealDB user repository
-    pub fn new(db: Arc<Mutex<Option<surrealdb::Surreal<surrealdb::engine::remote::ws::Client>>>>) -> Self {
+    pub fn new(db: Arc<Mutex<Option<surrealdb::Surreal<surrealdb::engine::local::Db>>>>) -> Self {
         Self { db }
     }
 }
@@ -67,207 +67,332 @@ impl SurrealUserRepository {
 #[async_trait]
 impl UserRepository for SurrealUserRepository {
     async fn create(&self, user: User) -> DatabaseResult<User> {
-        let client = self.db.lock().await;
-        let client = client.as_ref().ok_or(DatabaseError::NotInitialized)?;
+        let guard = self.db.lock().await;
+        let client = guard.as_ref().ok_or(DatabaseError::NotInitialized)?;
 
-        let user_data = serde_json::json!({
-            "id": user.id.to_string(),
-            "username": user.username,
-            "email": user.email,
-            "password_hash": user.password_hash,
-            "display_name": user.display_name,
-            "role": self.role_to_string(&user.role),
-            "is_active": user.is_active,
-            "last_login": user.last_login.map(|d| d.to_rfc3339()),
-            "created_at": user.created_at.to_rfc3339(),
-            "updated_at": user.updated_at.to_rfc3339(),
-        });
+        let role_str = self.role_to_string(&user.role);
+        let last_login_str = user.last_login.map(|dt| dt.to_rfc3339());
 
-        let query = format!(
-            "INSERT INTO user CONTENT {};",
-            serde_json::to_string(&user_data).map_err(|e| DatabaseError::SerializationError(e.to_string()))?
-        );
+        let mut response = client.query(
+            "CREATE user SET \
+             username = $username, \
+             email = $email, \
+             password_hash = $password_hash, \
+             display_name = $display_name, \
+             role = $role, \
+             is_active = $is_active, \
+             last_login = $last_login, \
+             created_at = $created_at, \
+             updated_at = $updated_at"
+        )
+        .bind(("username", user.username.clone()))
+        .bind(("email", user.email.clone()))
+        .bind(("password_hash", user.password_hash.clone()))
+        .bind(("display_name", user.display_name.clone()))
+        .bind(("role", role_str))
+        .bind(("is_active", user.is_active))
+        .bind(("last_login", last_login_str))
+        .bind(("created_at", user.created_at.to_rfc3339()))
+        .bind(("updated_at", user.updated_at.to_rfc3339()))
+        .await
+        .map_err(|e| DatabaseError::QueryError(e.to_string()))?;
 
-        let _ = client.query(&query)
-            .await
+        let results: Vec<serde_json::Value> = response.take(0)
             .map_err(|e| DatabaseError::QueryError(e.to_string()))?;
 
-        Ok(user)
+        if let Some(val) = results.into_iter().next() {
+            self.parse_user(val)
+        } else {
+            Ok(user)
+        }
     }
 
     async fn find_by_id(&self, id: Uuid) -> DatabaseResult<Option<User>> {
-        let client = self.db.lock().await;
-        let client = client.as_ref().ok_or(DatabaseError::NotInitialized)?;
+        let guard = self.db.lock().await;
+        let client = guard.as_ref().ok_or(DatabaseError::NotInitialized)?;
 
-        let query = format!("SELECT * FROM user WHERE id = '{}';", id);
-        
-        let result: Option<serde_json::Value> = client.query(&query)
-            .await
+        let mut response = client.query(
+            "SELECT * FROM user WHERE id = $id"
+        )
+        .bind(("id", id.to_string()))
+        .await
+        .map_err(|e| DatabaseError::QueryError(e.to_string()))?;
+
+        let results: Vec<serde_json::Value> = response.take(0)
             .map_err(|e| DatabaseError::QueryError(e.to_string()))?;
 
-        match result {
-            Some(value) => {
-                let user = self.parse_user(value)?;
-                Ok(Some(user))
-            }
+        match results.into_iter().next() {
+            Some(val) => Ok(Some(self.parse_user(val)?)),
             None => Ok(None),
         }
     }
 
     async fn find_by_username(&self, username: &str) -> DatabaseResult<Option<User>> {
-        let client = self.db.lock().await;
-        let client = client.as_ref().ok_or(DatabaseError::NotInitialized)?;
+        let guard = self.db.lock().await;
+        let client = guard.as_ref().ok_or(DatabaseError::NotInitialized)?;
 
-        let query = format!("SELECT * FROM user WHERE username = '{}';", username);
-        
-        let result: Option<serde_json::Value> = client.query(&query)
-            .await
+        let mut response = client.query(
+            "SELECT * FROM user WHERE username = $username"
+        )
+        .bind(("username", username.to_string()))
+        .await
+        .map_err(|e| DatabaseError::QueryError(e.to_string()))?;
+
+        let results: Vec<serde_json::Value> = response.take(0)
             .map_err(|e| DatabaseError::QueryError(e.to_string()))?;
 
-        match result {
-            Some(value) => {
-                let user = self.parse_user(value)?;
-                Ok(Some(user))
-            }
+        match results.into_iter().next() {
+            Some(val) => Ok(Some(self.parse_user(val)?)),
             None => Ok(None),
         }
     }
 
     async fn find_by_email(&self, email: &str) -> DatabaseResult<Option<User>> {
-        let client = self.db.lock().await;
-        let client = client.as_ref().ok_or(DatabaseError::NotInitialized)?;
+        let guard = self.db.lock().await;
+        let client = guard.as_ref().ok_or(DatabaseError::NotInitialized)?;
 
-        let query = format!("SELECT * FROM user WHERE email = '{}';", email);
-        
-        let result: Option<serde_json::Value> = client.query(&query)
-            .await
+        let mut response = client.query(
+            "SELECT * FROM user WHERE email = $email"
+        )
+        .bind(("email", email.to_string()))
+        .await
+        .map_err(|e| DatabaseError::QueryError(e.to_string()))?;
+
+        let results: Vec<serde_json::Value> = response.take(0)
             .map_err(|e| DatabaseError::QueryError(e.to_string()))?;
 
-        match result {
-            Some(value) => {
-                let user = self.parse_user(value)?;
-                Ok(Some(user))
-            }
+        match results.into_iter().next() {
+            Some(val) => Ok(Some(self.parse_user(val)?)),
             None => Ok(None),
         }
     }
 
     async fn find_by_role(&self, role: UserRole) -> DatabaseResult<Vec<User>> {
-        let client = self.db.lock().await;
-        let client = client.as_ref().ok_or(DatabaseError::NotInitialized)?;
+        let guard = self.db.lock().await;
+        let client = guard.as_ref().ok_or(DatabaseError::NotInitialized)?;
 
         let role_str = self.role_to_string(&role);
-        let query = format!("SELECT * FROM user WHERE role = '{}';", role_str);
-        
-        let result: Vec<serde_json::Value> = client.query(&query)
-            .await
+
+        let mut response = client.query(
+            "SELECT * FROM user WHERE role = $role"
+        )
+        .bind(("role", role_str))
+        .await
+        .map_err(|e| DatabaseError::QueryError(e.to_string()))?;
+
+        let results: Vec<serde_json::Value> = response.take(0)
             .map_err(|e| DatabaseError::QueryError(e.to_string()))?;
 
-        let users = result.into_iter()
-            .filter_map(|v| self.parse_user(v).ok())
-            .collect();
-
-        Ok(users)
+        results.into_iter()
+            .map(|val| self.parse_user(val))
+            .collect()
     }
 
     async fn list_all(&self) -> DatabaseResult<Vec<User>> {
-        let client = self.db.lock().await;
-        let client = client.as_ref().ok_or(DatabaseError::NotInitialized)?;
+        let guard = self.db.lock().await;
+        let client = guard.as_ref().ok_or(DatabaseError::NotInitialized)?;
 
-        let query = "SELECT * FROM user;";
-        
-        let result: Vec<serde_json::Value> = client.query(query)
-            .await
+        let mut response = client.query(
+            "SELECT * FROM user"
+        )
+        .await
+        .map_err(|e| DatabaseError::QueryError(e.to_string()))?;
+
+        let results: Vec<serde_json::Value> = response.take(0)
             .map_err(|e| DatabaseError::QueryError(e.to_string()))?;
 
-        let users = result.into_iter()
-            .filter_map(|v| self.parse_user(v).ok())
-            .collect();
-
-        Ok(users)
+        results.into_iter()
+            .map(|val| self.parse_user(val))
+            .collect()
     }
 
     async fn update(&self, id: Uuid, user: User) -> DatabaseResult<User> {
-        let client = self.db.lock().await;
-        let client = client.as_ref().ok_or(DatabaseError::NotInitialized)?;
+        let guard = self.db.lock().await;
+        let client = guard.as_ref().ok_or(DatabaseError::NotInitialized)?;
 
-        let user_data = serde_json::json!({
-            "id": id.to_string(),
-            "username": user.username,
-            "email": user.email,
-            "password_hash": user.password_hash,
-            "display_name": user.display_name,
-            "role": self.role_to_string(&user.role),
-            "is_active": user.is_active,
-            "last_login": user.last_login.map(|d| d.to_rfc3339()),
-            "updated_at": user.updated_at.to_rfc3339(),
-        });
+        // Verify the user exists
+        let mut check = client.query(
+            "SELECT * FROM user WHERE id = $id"
+        )
+        .bind(("id", id.to_string()))
+        .await
+        .map_err(|e| DatabaseError::QueryError(e.to_string()))?;
 
-        let query = format!(
-            "UPDATE user SET {} WHERE id = '{}';",
-            serde_json::to_string(&user_data).map_err(|e| DatabaseError::SerializationError(e.to_string()))?,
-            id
-        );
-
-        let _ = client.query(&query)
-            .await
+        let existing: Vec<serde_json::Value> = check.take(0)
             .map_err(|e| DatabaseError::QueryError(e.to_string()))?;
 
-        Ok(user)
+        if existing.is_empty() {
+            return Err(DatabaseError::NotFound(format!("User with id {} not found", id)));
+        }
+
+        let role_str = self.role_to_string(&user.role);
+        let last_login_str = user.last_login.map(|dt| dt.to_rfc3339());
+
+        let mut response = client.query(
+            "UPDATE user SET \
+             username = $username, \
+             email = $email, \
+             password_hash = $password_hash, \
+             display_name = $display_name, \
+             role = $role, \
+             is_active = $is_active, \
+             last_login = $last_login, \
+             updated_at = $updated_at \
+             WHERE id = $id"
+        )
+        .bind(("username", user.username.clone()))
+        .bind(("email", user.email.clone()))
+        .bind(("password_hash", user.password_hash.clone()))
+        .bind(("display_name", user.display_name.clone()))
+        .bind(("role", role_str))
+        .bind(("is_active", user.is_active))
+        .bind(("last_login", last_login_str))
+        .bind(("updated_at", user.updated_at.to_rfc3339()))
+        .bind(("id", id.to_string()))
+        .await
+        .map_err(|e| DatabaseError::QueryError(e.to_string()))?;
+
+        let results: Vec<serde_json::Value> = response.take(0)
+            .map_err(|e| DatabaseError::QueryError(e.to_string()))?;
+
+        if let Some(val) = results.into_iter().next() {
+            self.parse_user(val)
+        } else {
+            Ok(user)
+        }
     }
 
     async fn delete(&self, id: Uuid) -> DatabaseResult<bool> {
-        let client = self.db.lock().await;
-        let client = client.as_ref().ok_or(DatabaseError::NotInitialized)?;
+        let guard = self.db.lock().await;
+        let client = guard.as_ref().ok_or(DatabaseError::NotInitialized)?;
 
-        let query = format!("DELETE FROM user WHERE id = '{}';", id);
-        
-        let result: Option<serde_json::Value> = client.query(&query)
-            .await
+        // Check if the user exists
+        let mut check = client.query(
+            "SELECT * FROM user WHERE id = $id"
+        )
+        .bind(("id", id.to_string()))
+        .await
+        .map_err(|e| DatabaseError::QueryError(e.to_string()))?;
+
+        let existing: Vec<serde_json::Value> = check.take(0)
             .map_err(|e| DatabaseError::QueryError(e.to_string()))?;
 
-        Ok(result.is_some())
+        if existing.is_empty() {
+            return Ok(false);
+        }
+
+        client.query(
+            "DELETE FROM user WHERE id = $id"
+        )
+        .bind(("id", id.to_string()))
+        .await
+        .map_err(|e| DatabaseError::QueryError(e.to_string()))?;
+
+        Ok(true)
     }
 
     async fn username_exists(&self, username: &str) -> DatabaseResult<bool> {
-        let user = self.find_by_username(username).await?;
-        Ok(user.is_some())
+        let guard = self.db.lock().await;
+        let client = guard.as_ref().ok_or(DatabaseError::NotInitialized)?;
+
+        let mut response = client.query(
+            "SELECT count() FROM user WHERE username = $username GROUP ALL"
+        )
+        .bind(("username", username.to_string()))
+        .await
+        .map_err(|e| DatabaseError::QueryError(e.to_string()))?;
+
+        let results: Vec<serde_json::Value> = response.take(0)
+            .map_err(|e| DatabaseError::QueryError(e.to_string()))?;
+
+        let count = results.first()
+            .and_then(|v| v.get("count"))
+            .and_then(|c| c.as_u64())
+            .unwrap_or(0);
+
+        Ok(count > 0)
     }
 
     async fn email_exists(&self, email: &str) -> DatabaseResult<bool> {
-        let user = self.find_by_email(email).await?;
-        Ok(user.is_some())
+        let guard = self.db.lock().await;
+        let client = guard.as_ref().ok_or(DatabaseError::NotInitialized)?;
+
+        let mut response = client.query(
+            "SELECT count() FROM user WHERE email = $email GROUP ALL"
+        )
+        .bind(("email", email.to_string()))
+        .await
+        .map_err(|e| DatabaseError::QueryError(e.to_string()))?;
+
+        let results: Vec<serde_json::Value> = response.take(0)
+            .map_err(|e| DatabaseError::QueryError(e.to_string()))?;
+
+        let count = results.first()
+            .and_then(|v| v.get("count"))
+            .and_then(|c| c.as_u64())
+            .unwrap_or(0);
+
+        Ok(count > 0)
     }
 
     async fn update_password(&self, id: Uuid, password_hash: &str) -> DatabaseResult<()> {
-        let client = self.db.lock().await;
-        let client = client.as_ref().ok_or(DatabaseError::NotInitialized)?;
+        let guard = self.db.lock().await;
+        let client = guard.as_ref().ok_or(DatabaseError::NotInitialized)?;
 
-        let query = format!(
-            "UPDATE user SET password_hash = '{}' WHERE id = '{}';",
-            password_hash, id
-        );
+        // Verify the user exists
+        let mut check = client.query(
+            "SELECT * FROM user WHERE id = $id"
+        )
+        .bind(("id", id.to_string()))
+        .await
+        .map_err(|e| DatabaseError::QueryError(e.to_string()))?;
 
-        let _ = client.query(&query)
-            .await
+        let existing: Vec<serde_json::Value> = check.take(0)
             .map_err(|e| DatabaseError::QueryError(e.to_string()))?;
+
+        if existing.is_empty() {
+            return Err(DatabaseError::NotFound(format!("User with id {} not found", id)));
+        }
+
+        client.query(
+            "UPDATE user SET password_hash = $password_hash, updated_at = $updated_at WHERE id = $id"
+        )
+        .bind(("password_hash", password_hash.to_string()))
+        .bind(("updated_at", Utc::now().to_rfc3339()))
+        .bind(("id", id.to_string()))
+        .await
+        .map_err(|e| DatabaseError::QueryError(e.to_string()))?;
 
         Ok(())
     }
 
     async fn update_last_login(&self, id: Uuid) -> DatabaseResult<()> {
-        let client = self.db.lock().await;
-        let client = client.as_ref().ok_or(DatabaseError::NotInitialized)?;
+        let guard = self.db.lock().await;
+        let client = guard.as_ref().ok_or(DatabaseError::NotInitialized)?;
+
+        // Verify the user exists
+        let mut check = client.query(
+            "SELECT * FROM user WHERE id = $id"
+        )
+        .bind(("id", id.to_string()))
+        .await
+        .map_err(|e| DatabaseError::QueryError(e.to_string()))?;
+
+        let existing: Vec<serde_json::Value> = check.take(0)
+            .map_err(|e| DatabaseError::QueryError(e.to_string()))?;
+
+        if existing.is_empty() {
+            return Err(DatabaseError::NotFound(format!("User with id {} not found", id)));
+        }
 
         let now = Utc::now().to_rfc3339();
-        let query = format!(
-            "UPDATE user SET last_login = '{}' WHERE id = '{}';",
-            now, id
-        );
-
-        let _ = client.query(&query)
-            .await
-            .map_err(|e| DatabaseError::QueryError(e.to_string()))?;
+        client.query(
+            "UPDATE user SET last_login = $last_login WHERE id = $id"
+        )
+        .bind(("last_login", now))
+        .bind(("id", id.to_string()))
+        .await
+        .map_err(|e| DatabaseError::QueryError(e.to_string()))?;
 
         Ok(())
     }
@@ -304,9 +429,9 @@ impl SurrealUserRepository {
             _ => UserRole::User,
         };
         let is_active = obj.get("is_active").and_then(|v| v.as_bool()).unwrap_or(true);
-        let last_login = obj.get("last_login").and_then(|v| v.as_str()).and_then(|s| DateTime::parse_from_rfc3339(s).ok());
-        let created_at = obj.get("created_at").and_then(|v| v.as_str()).and_then(|s| DateTime::parse_from_rfc3339(s).ok()).unwrap_or_else(|| Utc::now());
-        let updated_at = obj.get("updated_at").and_then(|v| v.as_str()).and_then(|s| DateTime::parse_from_rfc3339(s).ok()).unwrap_or_else(|| Utc::now());
+        let last_login = obj.get("last_login").and_then(|v| v.as_str()).and_then(|s| DateTime::parse_from_rfc3339(s).ok()).map(|dt| dt.with_timezone(&Utc));
+        let created_at = obj.get("created_at").and_then(|v| v.as_str()).and_then(|s| DateTime::parse_from_rfc3339(s).ok()).map(|dt| dt.with_timezone(&Utc)).unwrap_or_else(|| Utc::now());
+        let updated_at = obj.get("updated_at").and_then(|v| v.as_str()).and_then(|s| DateTime::parse_from_rfc3339(s).ok()).map(|dt| dt.with_timezone(&Utc)).unwrap_or_else(|| Utc::now());
 
         Ok(User {
             id,

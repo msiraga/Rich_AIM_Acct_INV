@@ -8,6 +8,7 @@ use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
 use chrono::{DateTime, Utc};
 use tracing::{info, error, debug, warn};
+use serde::{Serialize, Deserialize};
 use crate::agents::status::{SystemStatus, AgentStatusInfo};
 use crate::agents::orchestrator::AgentOrchestrator;
 

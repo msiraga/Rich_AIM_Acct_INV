@@ -232,9 +232,9 @@ impl SystemStatus {
     /// Get system status summary
     pub fn summary(&self) -> String {
         format!(
-            "System Status: {} agents ({} active, {} idle, {} busy, {} errors) | " +
-            "Tasks: {} processed, {} failed, {} in progress | " +
-            "Health: {:.2}%",
+            "System Status: {} agents ({} active, {} idle, {} busy, {} errors) | \
+             Tasks: {} processed, {} failed, {} in progress | \
+             Health: {:.2}%",
             self.total_agents,
             self.active_agents,
             self.idle_agents,

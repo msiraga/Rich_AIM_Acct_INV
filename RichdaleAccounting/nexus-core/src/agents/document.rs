@@ -21,12 +21,12 @@ pub struct DocumentAgent {
     /// Current status
     pub status: AgentStatus,
     /// Database connection
-    pub db: Arc<Mutex<Option<surrealdb::Surreal<surrealdb::engine::remote::ws::Client>>>>,
+    pub db: Arc<Mutex<Option<surrealdb::Surreal<surrealdb::engine::local::Db>>>>,
 }
 
 impl DocumentAgent {
     /// Create a new document agent
-    pub fn new(config: AgentConfig, db: Arc<Mutex<Option<surrealdb::Surreal<surrealdb::engine::remote::ws::Client>>>>) -> Self {
+    pub fn new(config: AgentConfig, db: Arc<Mutex<Option<surrealdb::Surreal<surrealdb::engine::local::Db>>>>) -> Self {
         Self {
             config,
             status: AgentStatus::Idle,
@@ -35,7 +35,7 @@ impl DocumentAgent {
     }
 
     /// Create a document agent with default configuration
-    pub fn with_defaults(db: Arc<Mutex<Option<surrealdb::Surreal<surrealdb::engine::remote::ws::Client>>>>) -> Self {
+    pub fn with_defaults(db: Arc<Mutex<Option<surrealdb::Surreal<surrealdb::engine::local::Db>>>>) -> Self {
         let config = AgentConfig::document_agent();
         Self::new(config, db)
     }
@@ -99,12 +99,15 @@ impl Agent for DocumentAgent {
 impl DocumentAgent {
     /// Process a store document task
     async fn process_store_document(&self, task: Task) -> Result<Task, anyhow::Error> {
-        self.status = AgentStatus::Busy;
-        
+        // Status tracking deferred
+
         let start_time = std::time::Instant::now();
-        
+
+        // Clone task to avoid partial move when extracting payload
+        let task_clone = task.clone();
+
         // Extract document from task payload
-        let document = match task.payload {
+        let document = match task_clone.payload {
             TaskPayload::Document(doc) => doc,
             _ => return Err(AgentError::TaskProcessingFailed(
                 "Expected Document payload for StoreDocument task".to_string()
@@ -113,28 +116,31 @@ impl DocumentAgent {
 
         // Store the document in the database
         let stored_document = self.store_document(document).await?;
-        
+
         // Create success result
         let result = TaskResult::success_with_data(
             "Document stored successfully",
             TaskPayload::Document(stored_document)
         );
-        
+
         let processing_time = start_time.elapsed().as_millis() as f64;
-        
-        self.status = AgentStatus::Idle;
-        
+
+        // Status tracking deferred
+
         Ok(task.complete(result))
     }
 
     /// Process a retrieve document task
     async fn process_retrieve_document(&self, task: Task) -> Result<Task, anyhow::Error> {
-        self.status = AgentStatus::Busy;
-        
+        // Status tracking deferred
+
         let start_time = std::time::Instant::now();
-        
+
+        // Clone task to avoid partial move when extracting payload
+        let task_clone = task.clone();
+
         // Extract document ID from task payload
-        let document_id = match task.payload {
+        let document_id = match task_clone.payload {
             TaskPayload::String(id) => id,
             TaskPayload::Json(value) => value.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
             _ => return Err(AgentError::TaskProcessingFailed(
@@ -144,17 +150,17 @@ impl DocumentAgent {
 
         // Retrieve the document from the database
         let document = self.retrieve_document(&document_id).await?;
-        
+
         // Create success result
         let result = TaskResult::success_with_data(
             "Document retrieved successfully",
             TaskPayload::Document(document)
         );
-        
+
         let processing_time = start_time.elapsed().as_millis() as f64;
-        
-        self.status = AgentStatus::Idle;
-        
+
+        // Status tracking deferred
+
         Ok(task.complete(result))
     }
 

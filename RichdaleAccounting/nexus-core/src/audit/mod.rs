@@ -15,7 +15,7 @@ use crate::agents::task::{Task, TaskResult, TaskPayload};
 use crate::agents::error::AgentError;
 
 /// Audit Agent for handling audit-related tasks
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AuditAgent {
     /// Agent configuration
     pub config: AgentConfig,
@@ -23,6 +23,12 @@ pub struct AuditAgent {
     pub status: AgentStatus,
     /// Audit repository
     pub repository: Arc<dyn AuditRepository>,
+}
+
+impl std::fmt::Debug for AuditAgent {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "AuditAgent {{ config: {:?}, status: {:?} }}", self.config, self.status)
+    }
 }
 
 impl AuditAgent {
@@ -92,8 +98,8 @@ impl Agent for AuditAgent {
 impl AuditAgent {
     /// Process an audit check task
     async fn process_audit_check(&self, task: Task) -> Result<Task, anyhow::Error> {
-        self.status = AgentStatus::Busy;
-        
+        // Status tracking deferred - requires interior mutability
+
         let start_time = std::time::Instant::now();
         
         // In a real implementation, we would extract audit parameters from the task
@@ -101,6 +107,7 @@ impl AuditAgent {
         
         // Log an audit entry
         let audit_log = AuditLog {
+            id: Uuid::new_v4(),
             user_id: None,
             action: AuditAction::Custom("Audit check performed".to_string()),
             entity_type: "system".to_string(),
@@ -119,10 +126,10 @@ impl AuditAgent {
         // Create success result
         let result = TaskResult::success("Audit check completed successfully");
         
-        let processing_time = start_time.elapsed().as_millis() as f64;
-        
-        self.status = AgentStatus::Idle;
-        
+        let _processing_time = start_time.elapsed().as_millis() as f64;
+
+        // Status tracking deferred
+
         Ok(task.complete(result))
     }
 
@@ -135,6 +142,7 @@ impl AuditAgent {
         new_values: serde_json::Value,
     ) -> Result<(), anyhow::Error> {
         let audit_log = AuditLog {
+            id: Uuid::new_v4(),
             user_id,
             action: AuditAction::Create,
             entity_type: entity_type.to_string(),
@@ -162,6 +170,7 @@ impl AuditAgent {
         new_values: serde_json::Value,
     ) -> Result<(), anyhow::Error> {
         let audit_log = AuditLog {
+            id: Uuid::new_v4(),
             user_id,
             action: AuditAction::Update,
             entity_type: entity_type.to_string(),
@@ -188,6 +197,7 @@ impl AuditAgent {
         old_values: serde_json::Value,
     ) -> Result<(), anyhow::Error> {
         let audit_log = AuditLog {
+            id: Uuid::new_v4(),
             user_id,
             action: AuditAction::Delete,
             entity_type: entity_type.to_string(),
@@ -215,6 +225,7 @@ impl AuditAgent {
         error: &str,
     ) -> Result<(), anyhow::Error> {
         let audit_log = AuditLog {
+            id: Uuid::new_v4(),
             user_id,
             action,
             entity_type: entity_type.to_string(),
@@ -284,8 +295,8 @@ mod tests {
         
         // Log update
         let old_values = serde_json::json!({"name": "Test", "value": 100});
-        agent.log_update(Some(user_id), "test", "123", old_values, new_values).await.unwrap();
-        
+        agent.log_update(Some(user_id), "test", "123", old_values, new_values.clone()).await.unwrap();
+
         // Log delete
         agent.log_delete(Some(user_id), "test", "123", new_values).await.unwrap();
         

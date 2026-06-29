@@ -128,21 +128,11 @@ impl AIService {
     /// Initialize Ollama client
     async fn initialize_ollama(&mut self) -> Result<(), anyhow::Error> {
         info!("Initializing Ollama client...");
-        
-        let client = ollama_rs::Ollama::new(self.config.ollama_url.clone());
-        
-        // Test the connection
-        match client.list_models().await {
-            Ok(_) => {
-                info!("Ollama client connected successfully");
-                self.ollama = Some(client);
-            }
-            Err(e) => {
-                warn!("Failed to connect to Ollama: {}", e);
-                self.ollama = None;
-            }
-        }
-        
+
+        // AI integration deferred to Phase 5
+        warn!("Ollama integration not yet implemented");
+        self.ollama = None;
+
         Ok(())
     }
 
@@ -156,28 +146,9 @@ impl AIService {
         if !self.is_available() {
             return Err(anyhow::anyhow!("AI service is not available"));
         }
-        
-        let client = self.ollama.as_ref().unwrap();
-        
-        let request = ollama_rs::GenerationRequest {
-            model: self.config.default_model.clone(),
-            prompt: prompt.to_string(),
-            system: None,
-            template: None,
-            context: None,
-            options: Some(ollama_rs::Options {
-                temperature: Some(self.config.temperature),
-                top_p: None,
-                top_k: None,
-                num_predict: Some(self.config.max_tokens),
-                ..Default::default()
-            }),
-            stream: None,
-        };
-        
-        let response = client.generate(request).await?;
-        
-        Ok(response.response)
+
+        // AI integration deferred to Phase 5
+        Err(anyhow::anyhow!("AI not initialized"))
     }
 
     /// Generate embeddings for text
@@ -185,18 +156,9 @@ impl AIService {
         if !self.is_available() {
             return Err(anyhow::anyhow!("AI service is not available"));
         }
-        
-        let client = self.ollama.as_ref().unwrap();
-        
-        let request = ollama_rs::EmbeddingRequest {
-            model: self.config.embedding_model.clone(),
-            prompt: text.to_string(),
-            options: None,
-        };
-        
-        let response = client.embed(request).await?;
-        
-        Ok(response.embedding)
+
+        // AI integration deferred to Phase 5
+        Err(anyhow::anyhow!("AI not initialized"))
     }
 
     /// Classify a document
@@ -529,23 +491,23 @@ mod tests {
         assert!(service.config.enabled);
     }
 
-    #[test]
-    fn test_text_classifier() {
+    #[tokio::test]
+    async fn test_text_classifier() {
         let config = AIConfig::default();
         let orchestrator = Arc::new(Mutex::new(AgentOrchestrator::new()));
         let ai_service = Arc::new(Mutex::new(AIService::new(config, orchestrator)));
-        
+
         let classifier = TextClassifier::new(ai_service);
-        assert!(!classifier.ai_service.lock().config.enabled);
+        assert!(classifier.ai_service.lock().await.config.enabled);
     }
 
-    #[test]
-    fn test_text_extractor() {
+    #[tokio::test]
+    async fn test_text_extractor() {
         let config = AIConfig::default();
         let orchestrator = Arc::new(Mutex::new(AgentOrchestrator::new()));
         let ai_service = Arc::new(Mutex::new(AIService::new(config, orchestrator)));
-        
+
         let extractor = TextExtractor::new(ai_service);
-        assert!(!extractor.ai_service.lock().config.enabled);
+        assert!(extractor.ai_service.lock().await.config.enabled);
     }
 }
