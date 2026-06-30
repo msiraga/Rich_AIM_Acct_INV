@@ -50,59 +50,140 @@ Latest commit on main: (Phase 4 just committed — check git log)
 
 Read: RichdaleAccounting/Phases/06-phase-5-ai-pipeline.md
 
-10 tasks in 3 tracks:
+### CROSS-PHASE STRATEGY: Phases 5 + 6 + 7 can all run in parallel.
 
-### Track A — OCR (parallel: 5.1 + 5.2)
-5.1: Tesseract OCR → ai/ocr.rs (new)
-5.2: PDF extraction → ai/pdf.rs (new)
+All three phases create mostly NEW files. The only shared files across phases are
+`Cargo.toml`, `api/mod.rs`, and frontend `App.tsx` — these are handled centrally
+after all agents complete. This enables launching agents for all three phases
+simultaneously.
 
-### Track B — UI (parallel with A)
-5.3: Document upload page with drag-and-drop
+## Maximum Parallelism: 13 Agents Across All 3 Phases
 
-### Track C — AI Features (parallel with A, B)
-5.6: Embedding storage + vector search
-5.7: Transaction anomaly detection
-5.8: Smart account categorization
-
-### Wire (after A completes: 5.4 → 5.5 → 5.9 → 5.10)
-5.4: Wire OCR → AI extraction
-5.5: Auto-create transaction from extraction
-5.9: AI health endpoint
-5.10: E2E test — receipt upload → auto-transaction
-
-## Key File Paths (Updated for Phase 4)
+### File Conflict Map
 ```
-nexus-core/src/
-├── api/auth.rs          ← JWT creation/validation, role extractors, auth middleware
-├── api/mod.rs           ← axum server with 40+ endpoints
-├── accounting/
-│   ├── ap.rs            ← AP workflow (Vendor, ApBill, ApProcessor, ApAgent)
-│   ├── budget.rs        ← Budget tracking (Budget, BudgetManager, variance)
-│   ├── assets.rs        ← Fixed assets (FixedAsset, AssetManager, depreciation)
-│   └── reporting.rs     ← AR aging (ArAgingReport, generate_ar_aging)
-├── database/
-│   ├── user.rs          ← hash_password(), verify_password(), SurrealUserRepository
-│   ├── financial.rs     ← TransactionEntry with multi-currency fields
-│   └── models.rs        ← UserRole with level()/can_read()/can_write()/etc.
-├── utils/
-│   ├── import.rs        ← CSV import with parse_csv_line() quoted field parser
-│   └── export.rs        ← CSV/OFX export with account resolution
-└── tests/
-    └── e2e_test.rs      ← 20 integration tests
-
-nexus-ledger-tauri/src/
-├── lib/api.ts           ← Centralized API client with auth + refresh interceptor
-├── contexts/AuthContext.tsx  ← Auth state, login/register/logout, token storage
-├── components/ProtectedRoute.tsx ← Auth gate with loading spinner
-├── pages/LoginPage.tsx  ← Login form
-└── pages/RegisterPage.tsx ← Registration form
+                    ┌──────────────┐
+                    │  Cargo.toml  │  ← CENTRAL (all 3 phases add deps)
+                    │  api/mod.rs  │  ← CENTRAL (P5 health + P7 health/ready/rate-limit)
+                    │  App.tsx     │  ← CENTRAL (P5 Documents + P6 SyncStatus routes)
+                    └──────────────┘
+        ┌──────────────────┼──────────────────┐
+        │                  │                  │
+   ┌────┴────┐        ┌────┴────┐        ┌────┴────┐
+   │ Phase 5 │        │ Phase 6 │        │ Phase 7 │
+   │ 6 agents│        │ 8 agents│        │ 5 agents│
+   └─────────┘        └─────────┘        └─────────┘
 ```
+
+### Round 1 — 13 Parallel Agents (ALL new files, no conflicts)
+
+| # | Phase | Agent | Creates | Dependencies |
+|---|-------|-------|---------|-------------|
+| 1 | P5 | OCR | `ai/ocr.rs` | None |
+| 2 | P5 | PDF | `ai/pdf.rs` | None |
+| 3 | P5 | Embeddings | `ai/embeddings.rs` | None |
+| 4 | P5 | Anomaly | `ai/analysis.rs` | None |
+| 5 | P5 | Categorize | `ai/classification.rs` | None |
+| 6 | P5 | Upload UI | `pages/Documents.tsx` | Frontend only |
+| 7 | P6 | Encryption | `edge/encryption.rs` | None |
+| 8 | P6 | Compression | `edge/compression.rs` | None |
+| 9 | P6 | Local DB | `edge/local_db.rs` | None (schema self-contained) |
+| 10 | P6 | Sync UI | `components/SyncStatus.tsx` | Frontend only |
+| 11 | P7 | Rate Limiter | `api/middleware.rs` | None |
+| 12 | P7 | Health Endpoints | `api/routes/health.rs` | None |
+| 13 | P7 | Benchmarks | `benches/performance.rs` | None |
+| 14 | P7 | Documentation | `README.md`, `docs/user/` | None |
+
+### Phase 6 Sequential Chain (must run after Agent 9)
+Agents 7-9 are independent. But `edge/store.rs`, `edge/tracking.rs`, `edge/sync.rs`,
+and `edge/conflict.rs` form a logical chain — each builds on the previous schema:
+
+| Agent | File | Depends On |
+|-------|------|------------|
+| 6A | `edge/store.rs` | Agent 9 (local_db.rs schema) |
+| 6B | `edge/tracking.rs` | 6A (store CRUD ops) |
+| 6C | `edge/sync.rs` | 6B (change tracking) |
+| 6D | `edge/conflict.rs` | 6C (sync engine) |
+
+### Round 2 — Central Coordinator (after all agents)
+| Step | Files | What |
+|------|-------|------|
+| 1 | `Cargo.toml` | Add ALL deps: llama-cpp-rs, reqwest (Mistral OCR4), rusqlite, aes-gcm, lz4, governor, prometheus |
+| 2 | `ai/mod.rs` | Register 5 submodules + wire OCR→AI pipeline (5.4) |
+| 3 | `agents/document.rs` | Wire auto-transaction from extraction (5.5) |
+| 4 | `api/mod.rs` | Add AI health route (5.9) + health/ready routes (7.7) + rate limiter layer (7.3) |
+| 5 | `edge/mod.rs` | Register 7 submodules + offline toggle (6.6) |
+| 6 | `monitor/mod.rs` | Add Prometheus metrics export (7.6) |
+| 7 | `App.tsx` | Add Documents page route + SyncStatus component |
+| 8 | `index.css` | Add styles for Documents page + SyncStatus component |
+
+### Round 3 — Integration Tests
+| Phase | Test | File |
+|-------|------|------|
+| P5 | Receipt→OCR→AI→Transaction E2E | `tests/integration/ai.rs` |
+| P6 | Offline→5 txns→Online→Sync E2E | `tests/integration/edge.rs` |
+| P7 | 100 concurrent requests load test | `tests/load/` |
+
+### Round 4 — Final Gate (Phase 7 only)
+| Step | What |
+|------|------|
+| 7.15 | `cargo test --all` + `cargo audit` + `cargo clippy` |
+| 7.8-7.11 | Tauri packaging (Windows MSI + macOS DMG + system tray + auto-update) |
+
+### Agent Prompt Template (for ANY Round 1 agent)
+```
+You are implementing Phase [N] Task [N.X] for NexusLedger, a Rust accounting
+platform. Read the existing module's mod.rs for patterns.
+
+CREATE ONLY ONE NEW FILE. Do NOT edit Cargo.toml, api/mod.rs, App.tsx,
+or any module's mod.rs. Your file will be registered centrally.
+
+Phase-specific context:
+- P5 (AI): Mistral OCR4 API for PDFs, GGUF models via llama-cpp-rs (NOT Ollama),
+  graceful degradation required, GGUF paths in project memory.
+- P6 (Edge): SQLite via rusqlite, AES-256-GCM encryption, lz4 compression,
+  last-write-wins conflict resolution, eventually consistent sync.
+- P7 (Prod): governor rate limiter, prometheus metrics, tower-http CSRF/CSP,
+  serde_json for health responses, criterion for benchmarks.
+
+Include unit tests in your file.
+```
+
+## AI Stack Preferences (Phase 5)
+- **OCR:** Mistral OCR4 API (cloud) — NOT Tesseract
+- **LLM:** Two GGUF models already downloaded, NOT Ollama:
+  - Mistral: `C:\Users\msira\Downloads\Self_Healing_Python_Architect\mistral.gguf`
+  - Qwen3-4B: `C:\Users\msira\Downloads\aletheia_gauntlet\models\Qwen3-4B-Q8_0.gguf`
+- **Inference:** `llama-cpp-rs` crate
+- **Fallback:** `pdf-extract` crate for offline PDFs when Mistral API unavailable
 
 ## Freeze Token 5 (all must pass)
 - [ ] Receipt photo → OCR text → AI JSON → transaction created
-- [ ] AI degrades gracefully when Ollama unavailable
+- [ ] AI degrades gracefully when Mistral API / GGUF unavailable
 - [ ] Anomaly detection flags test case
-- [ ] Embeddings searchable
+- [ ] Embeddings searchable by similarity
 - [ ] cargo test: 0 failures
 
-Begin by reading TRACKER.md and 06-phase-5-ai-pipeline.md, then start Task 5.1.
+## Freeze Token 6 (all must pass)
+- [ ] CRUD works offline against local SQLite with `_dirty=true` flag
+- [ ] Online sync: dirty records pushed to SurrealDB
+- [ ] Pull: remote changes since last_sync appear in local SQLite
+- [ ] Conflict: last-write-wins, logged in audit trail
+- [ ] Sync status UI shows correct state (offline/syncing/up-to-date/error)
+- [ ] Sensitive fields encrypted at rest (AES-256-GCM)
+- [ ] Large documents compressed (lz4, measurable reduction)
+- [ ] Integration test: offline 5 txns → online → verify in SurrealDB → local matches
+
+## Freeze Token 7 (FINAL — all must pass)
+- [ ] `cargo test --all` green
+- [ ] `cargo audit` zero vulnerabilities
+- [ ] `cargo clippy -- -D warnings` clean
+- [ ] 10K tx benchmark < 2s (create, list, balance sheet)
+- [ ] 100 concurrent requests: zero errors, p99 < 500ms
+- [ ] No SurrealQL injection, no XSS vectors
+- [ ] CSRF protection on state-changing endpoints
+- [ ] `/health` returns 200, `/ready` returns 200, `/metrics` valid Prometheus
+- [ ] Windows MSI/EXE + macOS DMG build and install
+- [ ] System tray + auto-update functional
+- [ ] User documentation complete
+
+Begin by launching 14 parallel agents for Round 1, then proceed to Round 2 central wiring.
