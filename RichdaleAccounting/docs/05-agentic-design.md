@@ -30,15 +30,21 @@ A business owner doesn't think in debits and credits. They think:
 ┌─────────────────────────────────────────────────────────────────────┐
 │                     INTERACTION LAYER                               │
 │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐           │
-│  │ CLI Chat  │  │ Phone    │  │ Email    │  │ Web Chat  │          │
-│  │ (terminal)│  │ (Twilio) │  │ (IMAP)   │  │(WebSocket)│          │
+│  │ CLI Chat  │  │ Telegram  │  │ Email    │  │ Web Chat  │          │
+│  │ (terminal)│  │ Bot       │  │ (IMAP)   │  │(WebSocket)│          │
 │  └─────┬─────┘  └─────┬────┘  └─────┬────┘  └─────┬─────┘          │
+│        │              │             │              │                 │
+│        │         ┌────┴────┐        │              │                 │
+│        │         │WhatsApp │        │              │                 │
+│        │         │Business │        │              │                 │
+│        │         └────┬────┘        │              │                 │
 │        │              │             │              │                 │
 │        ▼              ▼             ▼              ▼                 │
 │  ┌──────────────────────────────────────────────────────┐          │
 │  │           NATURAL LANGUAGE UNDERSTANDING              │          │
 │  │  Intent extraction · Entity recognition · Context     │          │
 │  │  Disambiguation · Multi-turn conversation             │          │
+│  │  Voice message transcription (Whisper)                 │          │
 │  └──────────────────────┬───────────────────────────────┘          │
 └─────────────────────────┼───────────────────────────────────────────┘
                           │
@@ -47,7 +53,7 @@ A business owner doesn't think in debits and credits. They think:
 │                     AGENTIC ACTION LAYER                            │
 │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐             │
 │  │ EmailAgent    │  │ DocIntel     │  │ ApprovalGate │             │
-│  │ (IMAP monitor)│  │ Agent        │  │ (high-value) │             │
+│  │ (IMAP monitor)│  │ Agent        │  │ (inline keys)│             │
 │  │               │  │ (OCR/PDF)    │  │              │             │
 │  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘             │
 │         │                 │                 │                      │
@@ -104,34 +110,193 @@ Your cash balance is $12,345.67 (account 1000).
 
 **Implementation:** Rust binary `nexusledger chat` → opens WebSocket to API server → sends messages → receives responses.
 
-### 1.2 Phone (Twilio)
+### 1.2 Messaging Bot (Telegram + WhatsApp)
 
-The most accessible interface — no app, no computer, just call a number.
+The primary user-facing channel — no app to install, works on any phone, supports 
+**push notifications, voice messages, document sharing, and back-and-forth chat**.
+
+**Why Telegram/WhatsApp over Twilio voice calls:**
+- **Push notifications** — system proactively alerts user ("new invoice from Staples")
+- **Voice messages** — user sends a voice memo, system transcribes with Whisper and acts
+- **Document sharing** — user forwards an invoice PDF or photos a receipt, system processes it
+- **Asynchronous** — user responds when convenient, no live call pressure
+- **Back-and-forth** — natural conversation flow, multi-turn disambiguation
+- **Group chats** — accountant + business owner in same chat
+- **Free** (Telegram) or low-cost (WhatsApp Business API ~$0.005/msg)
+- **Inline keyboards** — Telegram buttons for "Approve / Reject" instead of typing
+
+#### Telegram Bot Example
 
 ```
-[User calls NexusLedger number]
+[User opens Telegram chat with @NexusLedgerBot]
 
-System: "Hi, this is Nexus. What can I help you with?"
+User: what are my sales this week?
 
-User: "What's my cash balance?"
+Nexus: 📊 Sales this week (Jun 24-30):
+       Total: $8,450.00 across 5 invoices
+       - INV-00000005: Acme Corp $1,500
+       - INV-00000006: XYZ Inc $2,200
+       - INV-00000007: Delta Co $1,750
+       - INV-00000008: Acme Corp $1,000
+       - INV-00000009: Beta LLC $2,000
+       
+       3 unpaid, 2 paid. Outstanding AR: $4,700.
 
-System: "Your cash balance is twelve thousand three hundred forty-five dollars and sixty-seven cents."
+User: create an invoice for Delta Co for 20 hours of dev work at $175/hr
 
-User: "Pay the rent bill"
+Nexus: ✅ Invoice INV-00000010 created
+       Customer: Delta Co
+       Description: 20 hours dev work @ $175/hr
+       Subtotal: $3,500.00
+       Tax (7.25%): $253.75
+       Total: $3,753.75
+       Due: Jul 30, 2026
+       
+       [📎 Download PDF]  [📧 Email to Delta Co]  [✅ Approve]
 
-System: "I found a rent bill for $1,500 to Landlord Corp, due June 30. 
-         Should I process the payment?"
+User: 📧 (taps button)
 
-User: "Yes"
+Nexus: ✅ Invoice emailed to billing@deltaco.com.
+       I'll notify you when payment is received.
 
-System: "Payment of $1,500 processed. Your new cash balance is $10,845.67."
+[Later — proactive notification]
+
+Nexus: 🔔 Payment received!
+       Delta Co paid INV-00000010 ($3,753.75)
+       Cash balance: $16,199.67
+```
+
+#### Voice Message Example
+
+```
+[User sends a voice message to Telegram bot]
+
+🎤 (voice memo): "log a receipt from Home Depot for 85 dollars 
+    for some tools"
+
+Nexus: 🎵 Transcribed: "log a receipt from Home Depot for 85 dollars 
+       for some tools"
+       
+       ✅ Receipt logged:
+       Vendor: Home Depot
+       Amount: $85.00
+       Category: Office Supplies (5040) — best match
+       
+       Dr. Office Supplies (5040) $85.00
+       Cr. Cash (1000) $85.00
+       
+       Is "Office Supplies" the right category? 
+       [✅ Yes]  [🔧 Change to Tools/Equipment]  [❌ Cancel]
+
+User: (taps 🔧)
+
+Nexus: What category?
+       [Office Supplies] [Rent] [Utilities] [COGS] [Other]
+
+User: (types) "other - tools"
+
+Nexus: ✅ Updated. Receipt recorded under "Tools" (5040 - Other).
+       I'll remember Home Depot → Tools for next time.
+```
+
+#### Proactive Notification Example
+
+```
+[Push notification at 9:00 AM]
+
+Nexus: 🔔 Good morning! Here's your daily summary:
+       
+       💰 Cash: $12,345.67
+       📥 3 new vendor emails (2 invoices, 1 statement)
+       ⚠️ Rent bill due tomorrow ($1,500)
+       📋 Payroll due Friday ($3,200)
+       
+       Projected cash after Friday: $7,645.67
+       
+       [📋 Review emails]  [💳 Pay rent now]  [📊 Full report]
+```
+
+#### Document Forwarding Example
+
+```
+[User forwards an email with invoice PDF attachment to the bot]
+
+User: (forwards email from billing@staples.com with invoice.pdf)
+
+Nexus: 📎 Document received from billing@staples.com
+       File: invoice.pdf (482 KB)
+       
+       Processing... ✅
+       
+       Extracted:
+       - Vendor: Staples
+       - Invoice #: INV-456
+       - Date: Jun 15, 2026
+       - Total: $125.50
+       - Line items: Printer paper $45.50, Toner $80.00
+       
+       Category: Office Supplies (5040)
+       
+       ✅ Bill recorded:
+       Dr. Office Supplies (5040) $125.50
+       Cr. Accounts Payable (2000) $125.50
+       
+       Due: Jul 15, 2026
+       [💳 Pay now]  [📅 Schedule payment]  [✅ Done]
+```
+
+#### WhatsApp Business Example
+
+```
+[Same capabilities, delivered via WhatsApp Business API]
+
+User: income statement for last year
+
+Nexus: 📊 Income Statement — Jan 1 to Dec 31, 2025
+
+       Revenue:
+         Sales Revenue:     $145,000.00
+         Service Revenue:    $87,500.00
+         Interest Revenue:      $320.00
+       ─────────────────────────────
+       Total Revenue:      $232,820.00
+
+       Expenses:
+         COGS:              $52,000.00
+         Salaries:          $68,000.00
+         Rent:              $18,000.00
+         Utilities:          $4,800.00
+         Office Supplies:    $3,200.00
+       ─────────────────────────────
+       Total Expenses:     $146,000.00
+
+       Net Income:          $86,820.00
+
+       [📄 Download PDF]  [📊 Compare to 2024]  [💵 Tax estimate]
 ```
 
 **Implementation:**
-- **Twilio** webhook → API server
-- **Speech-to-text**: Whisper (local) or Twilio's built-in STT
-- **Text-to-speech**: System generates response text → Twilio TTS
-- **Intent mapping**: Same NLU layer as CLI
+
+**Telegram:**
+- `teloxide` crate (Rust Telegram bot framework)
+- Webhook mode (API server receives POST from Telegram)
+- Supports: text, voice messages (OGG → Whisper STT), documents (PDF/images), 
+  inline keyboards (approval buttons), photos (receipt images → OCR)
+- Bot token from @BotFather
+- Free — no per-message cost
+
+**WhatsApp Business:**
+- Meta Cloud API (direct) or Twilio WhatsApp API
+- Webhook mode (same as Telegram)
+- Supports: text, voice messages, documents, images
+- Template messages for proactive notifications (pre-approved by Meta)
+- ~$0.005 per conversation (first 1,000 free/month)
+
+**Shared architecture:**
+- Both channels feed into the same NLU layer
+- Same agent orchestrator processes all requests
+- Same approval gate for high-value actions
+- Conversation context persists across channels (Telegram session → same context as CLI)
 
 ### 1.3 Email Bot (IMAP)
 
@@ -172,26 +337,26 @@ System actions:
 - **Attachment download**: MIME parser, save to temp dir
 - **Sender mapping**: Email address → vendor/customer record (with fuzzy matching)
 
-### 1.4 SMS (Twilio)
+### 1.4 SMS (via Telegram/WhatsApp)
 
-Quick actions for mobile users:
+Quick actions for mobile users — same bot, text-only:
 
 ```
-[User texts NexusLedger number]
+[User texts NexusLedger bot]
 
 User: "balance"
-System: "Cash: $12,345.67 | AR: $3,200.00 | AP: $850.00 | Net Income YTD: $5,450.00"
+Nexus: "💰 Cash: $12,345.67 | AR: $3,200.00 | AP: $850.00 | Net Income YTD: $5,450.00"
 
 User: "create invoice Acme Corp $2000 consulting"
-System: "✓ Invoice INV-00000002 created for Acme Corp, $2,000.00. Due 2026-07-30."
+Nexus: "✓ Invoice INV-00000002 created for Acme Corp, $2,000.00. Due 2026-07-30."
 
 User: "reconcile bank"
-System: "Starting bank reconciliation for account 1010...
+Nexus: "Starting bank reconciliation for account 1010...
          Found 12 statement transactions. 10 matched automatically. 
          2 need review. Check the app for details."
 ```
 
-**Implementation:** Same Twilio integration as phone, text-only channel.
+**Implementation:** Same Telegram/WhatsApp bot, text-only messages.
 
 ### 1.5 Web Chat (Tauri App)
 
@@ -449,45 +614,106 @@ impl ApprovalGate {
 
 ---
 
-## Layer 4: Voice Integration (Twilio)
+## Layer 4: Messaging Bot Integration (Telegram + WhatsApp)
 
 ### Architecture
 
 ```
-Phone Call → Twilio → Webhook (API server) → NLU → Orchestrator → Response → TTS → Twilio → Caller
+User Message → Telegram/WhatsApp Webhook → API Server → NLU → Orchestrator → Response → Bot Reply
 ```
+
+### Supported Input Types
+
+| Input Type | Processing | Example |
+|---|---|---|
+| Text message | NLU intent extraction | "create invoice for Acme $2000" |
+| Voice message | Whisper STT → NLU | 🎤 "log receipt from Staples $45" |
+| Document (PDF) | PDF extraction → AI parse | Forwarded vendor invoice |
+| Photo | OCR → AI parse | Photo of paper receipt |
+| Email forward | Parse forwarded email | Vendor bill email with attachment |
+| Inline button tap | Direct action mapping | [✅ Approve] [💳 Pay now] |
 
 ### Implementation
 
 ```rust
-// API endpoint for Twilio webhook
-async fn handle_call(req: TwilioRequest) -> TwilioResponse {
-    let speech_text = req.speech_result;  // STT output
-    
-    // Parse intent
-    let intent = nlu.parse(&speech_text).await;
-    
-    // Execute
-    let response = execute_intent(intent).await;
-    
-    // Generate voice response
-    TwilioResponse::say(&response.human_readable)
+// Telegram webhook handler (teloxide crate)
+async fn handle_telegram_update(update: TelegramUpdate) -> Response {
+    match update {
+        TelegramUpdate::Message(msg) => {
+            match msg.kind {
+                MessageKind::Text(text) => {
+                    // Text → NLU → Task
+                    let intent = nlu.parse(&text).await;
+                    let response = execute_intent(intent).await;
+                    bot.send_message(msg.chat.id, response.text).await;
+                    
+                    // If approval needed, send inline keyboard
+                    if response.needs_approval {
+                        bot.send_inline_keyboard(msg.chat.id, response.text, 
+                            vec![
+                                InlineButton::new("✅ Approve", "approve"),
+                                InlineButton::new("❌ Cancel", "cancel"),
+                            ]).await;
+                    }
+                }
+                MessageKind::Voice(voice) => {
+                    // Download voice file → Whisper STT → NLU
+                    let ogg_data = bot.download_file(&voice.file_id).await;
+                    let transcript = whisper.transcribe(&ogg_data).await;
+                    let intent = nlu.parse(&transcript).await;
+                    let response = execute_intent(intent).await;
+                    bot.send_message(msg.chat.id, 
+                        format!("🎵 Transcribed: \"{}\"\n\n{}", transcript, response.text)).await;
+                }
+                MessageKind::Document(doc) => {
+                    // Download document → DocumentIntelligenceAgent
+                    let file_data = bot.download_file(&doc.file_id).await;
+                    let extracted = doc_agent.extract_document(&file_data, &doc.file_name).await;
+                    let task = match extracted.doc_type {
+                        DocType::Invoice => Task::process_receipt(extracted.data),
+                        DocType::Receipt => Task::process_receipt(extracted.data),
+                        DocType::BankStatement => Task::reconcile_account(extracted.data),
+                    };
+                    orchestrator.submit_task(task).await;
+                    bot.send_message(msg.chat.id, 
+                        &format!("📎 Processed {}: {}", doc.file_name, extracted.summary)).await;
+                }
+                MessageKind::Photo(photo) => {
+                    // Download photo → OCR → AI parse
+                    let image = bot.download_file(&photo.file_id).await;
+                    let ocr_text = ocr_engine.recognize(&image).await;
+                    let extracted = doc_agent.parse_receipt_text(&ocr_text).await;
+                    // ... same as document flow
+                }
+                _ => {}
+            }
+        }
+        TelegramUpdate::CallbackQuery(query) => {
+            // Inline button tap (approval/rejection)
+            match query.data.as_str() {
+                "approve" => { approve_pending_action(query.from.id).await; }
+                "cancel" => { cancel_pending_action(query.from.id).await; }
+                _ => {}
+            }
+        }
+    }
 }
 ```
 
-### Supported Voice Commands
+### Proactive Notifications
 
-| Voice Command | Action |
+The system sends unsolicited messages when events occur:
+
+| Trigger | Notification |
 |---|---|
-| "What's my cash balance?" | Query account 1000 balance |
-| "How much do I owe?" | AP aging summary |
-| "Who owes me money?" | AR aging summary |
-| "Pay the [vendor] bill" | Process payment |
-| "Create invoice for [customer] [amount]" | Generate invoice |
-| "Log a receipt from [vendor] [amount]" | Process receipt |
-| "Run payroll" | Calculate payroll |
-| "Show me my profit" | Income statement summary |
-| "What's my tax liability?" | Tax calculation |
+| Vendor email received | "📎 New bill from Staples: $125.50. [Approve] [Review]" |
+| Invoice paid by customer | "✅ Acme Corp paid INV-00000001 ($1,500). Cash: $13,845.67" |
+| Bill due tomorrow | "⚠️ Rent bill due tomorrow ($1,500). [Pay now] [Schedule]" |
+| Low cash balance | "⚠️ Cash dropped below $5,000 ($4,827). Payroll due Friday." |
+| Payroll due | "📋 Payroll due Friday. 5 employees, est. gross: $8,200. [Run payroll]" |
+| Reconciliation complete | "✅ Bank reconciliation complete. 15/18 matched. 2 need review." |
+| Anomaly detected | "🚨 Unusual: $5,000 transfer to unknown account. [Investigate]" |
+| Daily summary (9 AM) | "🌅 Cash: $12,345 | AR: $3,200 | AP: $850 | 3 emails pending" |
 
 ---
 
@@ -499,26 +725,28 @@ async fn handle_call(req: TwilioRequest) -> TwilioResponse {
 - [ ] CLI `nexusledger chat` command
 - [ ] Basic NLU (intent matching + entity extraction)
 - [ ] Tauri React app with chat sidebar
-- [ ] No email/phone integration yet
+- [ ] No email/messaging integration yet
 
-### Phase 4: Auth + Accounting Completeness + Email
+### Phase 4: Auth + Accounting Completeness + Email + Telegram Bot
 
 - [ ] User authentication (JWT, RBAC)
+- [ ] **Telegram bot** — text, voice messages, document/photo sharing, inline buttons
 - [ ] IMAP email monitoring (EmailAgent)
 - [ ] Document intelligence (OCR + PDF extraction)
 - [ ] Auto-classification of emails and attachments
 - [ ] Sender → vendor/customer mapping
 - [ ] Auto-bill-entry from vendor emails
+- [ ] Proactive notifications via Telegram
+- [ ] WhatsApp Business API (secondary channel)
 
-### Phase 5: AI Pipeline + Voice
+### Phase 5: AI Pipeline + Voice Messages
 
 - [ ] Ollama integration for NLU
-- [ ] Twilio phone integration
-- [ ] SMS command channel
-- [ ] Voice command recognition
+- [ ] Whisper STT for voice messages (Telegram voice memos)
 - [ ] Learning from corrections ("no, that's Office Supplies not Rent")
 - [ ] Anomaly detection ("this bill is 3x higher than usual")
 - [ ] Proactive insights ("your cash balance is low, you have payroll due Friday")
+- [ ] Vendor pattern learning (Home Depot → Tools, Staples → Office Supplies)
 
 ---
 
@@ -527,10 +755,10 @@ async fn handle_call(req: TwilioRequest) -> TwilioResponse {
 | Agent | Purpose | Phase |
 |---|---|---|
 | `ConversationAgent` | Natural language → Task mapping, multi-turn context | P3 |
+| `MessagingBotAgent` | Telegram/WhatsApp webhook, voice message STT, document/photo handling, inline buttons, proactive notifications | P4 |
 | `EmailAgent` | IMAP monitoring, email classification, attachment handling | P4 |
 | `DocumentIntelligenceAgent` | OCR, PDF extraction, structured data parsing | P5 |
-| `VoiceAgent` | Twilio webhook, STT/TTS, voice command processing | P5 |
-| `NotificationAgent` | Push notifications, email alerts, SMS alerts | P4 |
+| `NotificationAgent` | Proactive alerts (Telegram, email, in-app), daily summaries, threshold triggers | P4 |
 
 ---
 
@@ -637,10 +865,11 @@ Nexus: "Heads up — your cash balance dropped below $5,000 ($4,827.33).
 | NLU (intent + entity extraction) | ❌ None | P3 (basic) / P5 (LLM) |
 | React frontend with chat | ❌ Skeleton | P3 |
 | WebSocket real-time | ❌ None | P3 |
+| Telegram bot (text/voice/docs/buttons) | ❌ None | P4 |
+| WhatsApp Business API | ❌ None | P4 |
 | Email integration (IMAP) | ❌ None | P4 |
 | Document intelligence (OCR/PDF) | ❌ None | P5 |
-| Twilio phone integration | ❌ None | P5 |
-| SMS channel | ❌ None | P5 |
-| Proactive monitoring | ❌ None | P4 |
+| Voice message transcription (Whisper) | ❌ None | P5 |
+| Proactive notifications | ❌ None | P4 |
 | Learning from corrections | ❌ None | P5 |
 | Approval workflow | ❌ None | P3 (basic) / P4 (full) |
