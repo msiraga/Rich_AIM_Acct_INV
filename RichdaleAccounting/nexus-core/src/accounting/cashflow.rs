@@ -6,6 +6,7 @@ use serde::{Serialize, Deserialize};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use chrono::{DateTime, Utc};
+use tracing::warn;
 use crate::accounting::ledger::Ledger;
 use crate::database::financial::{AccountType, EntryType};
 use std::sync::Arc;
@@ -83,25 +84,30 @@ pub async fn generate_cash_flow_statement(
 
             let amount = if is_increase { entry.amount } else { -entry.amount };
 
-            match acc.number.as_str() {
-                // Revenue/Expense → goes to net income
-                n if n.starts_with('4') => net_income += amount,
-                n if n.starts_with('5') => net_income -= amount,
-                "1020" => ar_change -= amount, // AR decrease = cash inflow
-                "1030" => inv_change -= amount, // Inventory increase = cash outflow
-                "2000" => ap_change += amount,  // AP increase = cash inflow
-                "2010" => loan_proceeds += if amount > dec!(0) { amount } else { dec!(0) },
-                "2010" => loan_payments += if amount < dec!(0) { -amount } else { dec!(0) },
-                "2020" => accrual_change += amount,
-                "1040" => {
+            // Use AccountType enum matching instead of account-number string prefixes
+            match (&acc.account_type, acc.number.as_str()) {
+                // Revenue/Expense → goes to net income (determined by AccountType, not number prefix)
+                (AccountType::Revenue, _) => net_income += amount,
+                (AccountType::Expense, _) => net_income -= amount,
+                // Working capital changes by specific account number
+                (_, "1020") => ar_change -= amount, // AR decrease = cash inflow
+                (_, "1030") => inv_change -= amount, // Inventory increase = cash outflow
+                (_, "2000") => ap_change += amount,  // AP increase = cash inflow
+                (_, "2010") => {
+                    if amount > dec!(0) { loan_proceeds += amount; }
+                    else { loan_payments += -amount; }
+                }
+                (_, "2020") => accrual_change += amount,
+                (_, "1050") => depreciation += amount, // Accumulated Depreciation increase = non-cash expense
+                (_, "1040") => {
                     if amount > dec!(0) { fixed_asset_purchases += amount; }
                     else { fixed_asset_sales += -amount; }
                 }
-                "3000" => {
+                (_, "3000") => {
                     if amount > dec!(0) { owner_contributions += amount; }
                     else { owner_draws += -amount; }
                 }
-                "3010" => {} // retained earnings movements already in net income
+                (_, "3010") => {} // retained earnings movements already in net income
                 _ => {}
             }
         }
@@ -126,7 +132,18 @@ pub async fn generate_cash_flow_statement(
 
     let begin_cash = ledger.get_account_by_number("1000").await
         .map_err(|e| CashFlowError::other(&e.to_string()))?;
-    let begin_balance = begin_cash.map(|a| a.balance).unwrap_or(dec!(0)) - net_change;
+    let ending_cash_actual = begin_cash.map(|a| a.balance).unwrap_or(dec!(0));
+    let begin_balance = ending_cash_actual - net_change;
+    let ending_cash = begin_balance + net_change;
+
+    // Reconciliation assertion: verify that net_change equals ending - beginning
+    let reconciliation_diff = ending_cash - begin_balance - net_change;
+    if reconciliation_diff != dec!(0) {
+        warn!(
+            "Cash flow reconciliation mismatch: net_change={}, ending-beginning={}, diff={}",
+            net_change, ending_cash - begin_balance, reconciliation_diff
+        );
+    }
 
     Ok(CashFlowStatement {
         operating_activities: vec![

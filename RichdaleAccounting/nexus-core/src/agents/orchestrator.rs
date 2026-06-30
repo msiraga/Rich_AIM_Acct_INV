@@ -247,6 +247,14 @@ impl AgentOrchestrator {
                     processor
                 )))
             }
+            AgentType::ApAgent => {
+                let mut processor = crate::accounting::ap::ApProcessor::new();
+                processor.ledger = self.shared_ledger.clone();
+                Arc::new(Mutex::new(crate::accounting::ap::ApAgent::new(
+                    config.clone(),
+                    processor
+                )))
+            }
             AgentType::PayrollAgent => {
                 let mut processor = crate::accounting::payroll::PayrollProcessor::new();
                 if let Some(ref db) = self.database {

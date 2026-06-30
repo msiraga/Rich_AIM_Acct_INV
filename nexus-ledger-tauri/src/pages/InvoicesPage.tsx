@@ -1,6 +1,5 @@
 import { useState, useEffect } from "react";
-
-const API = "http://localhost:4000";
+import { apiGet, apiPost } from "../lib/api";
 
 interface InvoiceTransaction {
   id: string;
@@ -21,8 +20,7 @@ function InvoicesPage() {
 
   const fetchInvoices = () => {
     setLoading(true);
-    fetch(`${API}/api/v1/invoices`)
-      .then((r) => r.json())
+    apiGet<{ success: boolean; data: { data: InvoiceTransaction[] }; error?: string }>("/api/v1/invoices")
       .then((res) => {
         if (res.success) {
           setInvoices(res.data.data);
@@ -42,15 +40,10 @@ function InvoicesPage() {
     e.preventDefault();
     setSubmitting(true);
     try {
-      const response = await fetch(`${API}/api/v1/invoices`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          customer_name: form.customer_name,
-          items: [{ description: form.description, quantity: 1, unit_price: form.amount }],
-        }),
+      const res = await apiPost<{ success: boolean; error?: string }>("/api/v1/invoices", {
+        customer_name: form.customer_name,
+        items: [{ description: form.description, quantity: 1, unit_price: form.amount }],
       });
-      const res = await response.json();
       if (res.success) {
         setShowForm(false);
         setForm({ customer_name: "", amount: "", description: "" });

@@ -130,6 +130,7 @@ impl Ledger {
         self.create_account(Account::new("1020", "Accounts Receivable", AccountType::Asset)).await?;
         self.create_account(Account::new("1030", "Inventory", AccountType::Asset)).await?;
         self.create_account(Account::new("1040", "Fixed Assets", AccountType::Asset)).await?;
+        self.create_account(Account::new("1050", "Accumulated Depreciation", AccountType::Asset)).await?;
         
         // Liability accounts
         self.create_account(Account::new("2000", "Accounts Payable", AccountType::Liability)).await?;
@@ -151,6 +152,7 @@ impl Ledger {
         self.create_account(Account::new("5020", "Rent Expense", AccountType::Expense)).await?;
         self.create_account(Account::new("5030", "Utilities Expense", AccountType::Expense)).await?;
         self.create_account(Account::new("5040", "Office Supplies Expense", AccountType::Expense)).await?;
+        self.create_account(Account::new("5050", "Depreciation Expense", AccountType::Expense)).await?;
         
         info!("Created {} default accounts", self.accounts.read().await.len());
         

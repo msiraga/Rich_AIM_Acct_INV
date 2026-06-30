@@ -1,7 +1,6 @@
 import { useState, useEffect } from "react";
 import { Link } from "react-router-dom";
-
-const API = "http://localhost:4000";
+import { apiGet } from "../lib/api";
 
 interface StatusData {
   status: string;
@@ -29,8 +28,8 @@ function DashboardPage() {
 
   useEffect(() => {
     Promise.all([
-      fetch(`${API}/api/v1/status`).then((r) => r.json()),
-      fetch(`${API}/api/v1/accounts`).then((r) => r.json()),
+      apiGet<{ success: boolean; data: StatusData }>("/api/v1/status"),
+      apiGet<{ success: boolean; data: typeof accounts }>("/api/v1/accounts"),
     ])
       .then(([statusRes, accountsRes]) => {
         if (statusRes.success) setStatus(statusRes.data);

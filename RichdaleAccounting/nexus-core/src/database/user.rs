@@ -1,14 +1,53 @@
 //! Database User Module
 //!
-//! Handles user storage and retrieval in the database.
+//! Handles user storage and retrieval in the database, plus password hashing
+//! with argon2 (recommended algorithm per OWASP).
 
 use async_trait::async_trait;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 use chrono::{DateTime, Utc};
+use argon2::{
+    password_hash::{
+        rand_core::OsRng,
+        PasswordHash, PasswordHasher, PasswordVerifier, SaltString,
+    },
+    Argon2,
+};
 use crate::database::models::{User, UserRole};
 use crate::database::error::{DatabaseError, DatabaseResult};
+
+// ── Password Hashing ───────────────────────────────────────────────────────
+
+/// Hash a plaintext password with argon2id (memory-hard, side-channel resistant).
+///
+/// Returns a PHC-encoded hash string (e.g. `$argon2id$v=19$m=19456,t=2,p=1$...`).
+/// The salt is randomly generated for each call — no two hashes are the same.
+pub fn hash_password(password: &str) -> DatabaseResult<String> {
+    if password.is_empty() {
+        return Err(DatabaseError::ValidationError("Password cannot be empty".into()));
+    }
+    let salt = SaltString::generate(&mut OsRng);
+    let argon2 = Argon2::default();
+    let hash = argon2
+        .hash_password(password.as_bytes(), &salt)
+        .map_err(|e| DatabaseError::ValidationError(format!("Password hashing failed: {}", e)))?;
+    Ok(hash.to_string())
+}
+
+/// Verify a plaintext password against a PHC-encoded argon2 hash.
+///
+/// Returns `Ok(true)` if the password matches, `Ok(false)` if it does not,
+/// or an error if the hash string is malformed.
+pub fn verify_password(password: &str, hash: &str) -> DatabaseResult<bool> {
+    let parsed_hash = PasswordHash::new(hash)
+        .map_err(|e| DatabaseError::ValidationError(format!("Invalid password hash: {}", e)))?;
+    let argon2 = Argon2::default();
+    Ok(argon2
+        .verify_password(password.as_bytes(), &parsed_hash)
+        .is_ok())
+}
 
 /// User repository
 #[async_trait]
@@ -622,21 +661,73 @@ mod tests {
     #[tokio::test]
     async fn test_find_by_role() {
         let repo = MemoryUserRepository::new();
-        
+
         // Create users with different roles
         let mut admin = User::new("admin", "admin@example.com", "Admin");
         admin.role = UserRole::Admin;
         repo.create(admin).await.unwrap();
-        
+
         let mut user = User::new("user", "user@example.com", "User");
         user.role = UserRole::User;
         repo.create(user).await.unwrap();
-        
+
         // Find by role
         let admins = repo.find_by_role(UserRole::Admin).await.unwrap();
         assert_eq!(admins.len(), 1);
-        
+
         let users = repo.find_by_role(UserRole::User).await.unwrap();
         assert_eq!(users.len(), 1);
+    }
+
+    // ── Password hashing tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_hash_password_produces_phc_string() {
+        let hash = hash_password("my-secret-password").unwrap();
+        // PHC format starts with $argon2
+        assert!(hash.starts_with("$argon2id"), "Expected argon2id PHC format, got: {}", hash);
+    }
+
+    #[test]
+    fn test_verify_password_correct() {
+        let password = "correct-horse-battery-staple";
+        let hash = hash_password(password).unwrap();
+        assert!(verify_password(password, &hash).unwrap());
+    }
+
+    #[test]
+    fn test_verify_password_incorrect() {
+        let hash = hash_password("real-password").unwrap();
+        assert!(!verify_password("wrong-password", &hash).unwrap());
+    }
+
+    #[test]
+    fn test_verify_password_empty() {
+        let hash = hash_password("some-password").unwrap();
+        assert!(!verify_password("", &hash).unwrap());
+    }
+
+    #[test]
+    fn test_hash_password_unique_salts() {
+        let password = "same-password";
+        let hash1 = hash_password(password).unwrap();
+        let hash2 = hash_password(password).unwrap();
+        // Same password must produce different hashes due to random salts
+        assert_ne!(hash1, hash2);
+        // But both must verify
+        assert!(verify_password(password, &hash1).unwrap());
+        assert!(verify_password(password, &hash2).unwrap());
+    }
+
+    #[test]
+    fn test_verify_password_rejects_malformed_hash() {
+        let result = verify_password("anything", "not-a-valid-hash");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_hash_password_empty_password_rejected() {
+        let result = hash_password("");
+        assert!(result.is_err());
     }
 }

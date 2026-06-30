@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef } from "react";
+import { API_BASE } from "../lib/api";
 
 interface ChatMessage {
   type: "system" | "response" | "error";
@@ -18,10 +19,12 @@ function ChatSidebar() {
   useEffect(() => {
     if (!isOpen || wsRef.current) return;
 
-    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-    const host = window.location.hostname || "localhost";
-    const port = "4000";
-    const ws = new WebSocket(`${protocol}//${host}:${port}/ws/chat`);
+    const accessToken = localStorage.getItem("nexus_access_token");
+    if (!accessToken) return;
+
+    // Derive ws:// or wss:// from API_BASE (http:// → ws://, https:// → wss://)
+    const wsUrl = API_BASE.replace(/^http/, "ws") + `/ws/chat?token=${encodeURIComponent(accessToken)}`;
+    const ws = new WebSocket(wsUrl);
 
     ws.onopen = () => {
       setConnected(true);

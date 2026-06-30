@@ -38,6 +38,7 @@ fn default_accounts() -> Vec<SeedAccount> {
         ("1020", "Accounts Receivable", "asset"),
         ("1030", "Inventory", "asset"),
         ("1040", "Fixed Assets", "asset"),
+        ("1050", "Accumulated Depreciation", "asset"),
         // Liabilities
         ("2000", "Accounts Payable", "liability"),
         ("2010", "Loans Payable", "liability"),
@@ -55,6 +56,7 @@ fn default_accounts() -> Vec<SeedAccount> {
         ("5020", "Rent Expense", "expense"),
         ("5030", "Utilities Expense", "expense"),
         ("5040", "Office Supplies Expense", "expense"),
+        ("5050", "Depreciation Expense", "expense"),
     ];
 
     entries
@@ -118,7 +120,7 @@ mod tests {
     #[test]
     fn test_default_accounts_count() {
         let accounts = default_accounts();
-        assert_eq!(accounts.len(), 18);
+        assert_eq!(accounts.len(), 20);
     }
 
     #[test]

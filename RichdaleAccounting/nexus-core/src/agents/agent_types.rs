@@ -15,6 +15,8 @@ pub enum AgentType {
     ReconciliationAgent,
     /// Processes invoices and billing
     InvoiceAgent,
+    /// Handles accounts payable (vendor bills, payments)
+    ApAgent,
     /// Manages payroll calculations and processing
     PayrollAgent,
     /// Handles tax calculations and filings

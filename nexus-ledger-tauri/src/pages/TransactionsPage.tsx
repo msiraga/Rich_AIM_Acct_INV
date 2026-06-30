@@ -1,6 +1,5 @@
 import { useState, useEffect } from "react";
-
-const API = "http://localhost:4000";
+import { apiGet } from "../lib/api";
 
 interface Entry {
   account_id: string;
@@ -34,8 +33,9 @@ function TransactionsPage() {
 
   const fetchTransactions = (offset: number) => {
     setLoading(true);
-    fetch(`${API}/api/v1/transactions?limit=${limit}&offset=${offset}`)
-      .then((r) => r.json())
+    apiGet<{ success: boolean; data: { data: Transaction[]; pagination: Pagination }; error?: string }>(
+      `/api/v1/transactions?limit=${limit}&offset=${offset}`,
+    )
       .then((res) => {
         if (res.success) {
           setTransactions(res.data.data);

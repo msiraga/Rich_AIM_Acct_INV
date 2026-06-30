@@ -147,6 +147,7 @@ impl AgentSystemConfig {
             AgentType::LedgerAgent => "ledger",
             AgentType::ReconciliationAgent => "reconciliation",
             AgentType::InvoiceAgent => "invoice",
+            AgentType::ApAgent => "ap",
             AgentType::PayrollAgent => "payroll",
             AgentType::TaxAgent => "tax",
             AgentType::ReceiptAgent => "receipt",

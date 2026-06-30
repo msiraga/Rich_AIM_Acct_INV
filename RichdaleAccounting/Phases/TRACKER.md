@@ -152,31 +152,31 @@ Last updated: 2026-06-30
 
 | ID | Task | Status |
 |---|---|---|
-| 4.1 | Password hashing (argon2/bcrypt) | [ ] |
-| 4.2 | JWT auth middleware | [ ] |
-| 4.3 | Login/Register endpoints | [ ] |
-| 4.4 | Role-based access control | [ ] |
-| 4.5 | Login UI | [ ] |
-| 4.6 | Accounts Payable workflow | [ ] |
-| 4.7 | Accounts Receivable aging report | [ ] |
-| 4.8 | Cash Flow Statement | [ ] |
-| 4.9 | CSV import | [ ] |
-| 4.10 | CSV/OFX export | [ ] |
-| 4.11 | Multi-currency support | [ ] |
-| 4.12 | Budget tracking | [ ] |
-| 4.13 | Fixed asset tracking + depreciation | [ ] |
-| 4.14 | Integration tests for all new features | [ ] |
+| 4.1 | Password hashing (argon2/bcrypt) | [x] |
+| 4.2 | JWT auth middleware | [x] |
+| 4.3 | Login/Register endpoints | [x] |
+| 4.4 | Role-based access control | [x] |
+| 4.5 | Login UI | [x] |
+| 4.6 | Accounts Payable workflow | [x] |
+| 4.7 | Accounts Receivable aging report | [x] |
+| 4.8 | Cash Flow Statement | [x] |
+| 4.9 | CSV import | [x] |
+| 4.10 | CSV/OFX export | [x] |
+| 4.11 | Multi-currency support | [x] |
+| 4.12 | Budget tracking | [x] |
+| 4.13 | Fixed asset tracking + depreciation | [x] |
+| 4.14 | Integration tests for all new features | [x] |
 
 ### Freeze Token 4
 
 | # | Condition | Status |
 |---|---|---|
-| 🔒 | Registration + login works end-to-end | [ ] |
-| 🔒 | JWT validated on every request | [ ] |
-| 🔒 | Role-based access enforced | [ ] |
-| 🔒 | AP/AR/Cash Flow all functional | [ ] |
-| 🔒 | CSV import works to import 3 transactions | [ ] |
-| 🔒 | Multi-currency converts EUR to USD | [ ] |
+| 🔒 | Registration + login works end-to-end | [x] |
+| 🔒 | JWT validated on every request | [x] |
+| 🔒 | Role-based access enforced | [x] |
+| 🔒 | AP/AR/Cash Flow all functional | [x] |
+| 🔒 | CSV import works to import 3 transactions | [x] |
+| 🔒 | Multi-currency converts EUR to USD | [x] |
 
 ---
 

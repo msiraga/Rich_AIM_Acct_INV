@@ -347,6 +347,177 @@ impl ReportingAgent {
             period_end: end,
         })
     }
+
+    /// Generate an AR aging report — outstanding invoices grouped by age.
+    ///
+    /// `as_of_date` determines the cutoff for aging calculations. Pass `None`
+    /// to default to `Utc::now()`.
+    ///
+    /// Payment matching uses transaction metadata:
+    /// - `invoice_number` field matching the invoice's number, OR
+    /// - `ap_payment` flag with an `invoice_id` field matching the invoice's ID
+    ///
+    /// Partial payments are supported: all matching payment amounts are summed,
+    /// and only the remaining balance is shown. Invoices with `remaining <= 0`
+    /// are excluded.
+    pub async fn generate_ar_aging(
+        &self,
+        as_of_date: Option<DateTime<Utc>>,
+    ) -> ReportingResult<ArAgingReport> {
+        let ledger = self
+            .ledger
+            .as_ref()
+            .ok_or_else(|| ReportingError::MissingData("No ledger connected".to_string()))?;
+
+        let transactions = ledger
+            .list_transactions()
+            .await
+            .map_err(|e| ReportingError::GenerationError(e.to_string()))?;
+
+        let as_of = as_of_date.unwrap_or_else(Utc::now);
+        let mut buckets = ArAgingBuckets::default();
+
+        for txn in &transactions {
+            if txn.transaction_type != crate::database::financial::TransactionType::Invoice {
+                continue;
+            }
+
+            let invoice_amount = txn.total_amount();
+
+            // Sum all payment amounts that reference this invoice via metadata
+            let mut total_payments = dec!(0);
+            for t in &transactions {
+                if t.transaction_type != crate::database::financial::TransactionType::Payment {
+                    continue;
+                }
+
+                // Check if this payment references the invoice via metadata:
+                // 1. invoice_number field matching the invoice's number
+                // 2. ap_payment flag with invoice_id matching the invoice's ID
+                let matches = t
+                    .metadata
+                    .get("invoice_number")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s == txn.number)
+                    .unwrap_or(false)
+                    || (t
+                        .metadata
+                        .get("ap_payment")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false)
+                        && t
+                            .metadata
+                            .get("invoice_id")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s == txn.id.to_string())
+                            .unwrap_or(false));
+
+                if matches {
+                    total_payments += t.total_amount();
+                }
+            }
+
+            // Compute remaining balance (supports partial payments)
+            let remaining = invoice_amount - total_payments;
+            if remaining <= dec!(0) {
+                continue; // fully paid or overpaid — skip
+            }
+
+            // Use due_date if available, otherwise fall back to invoice date
+            let due_date = txn
+                .metadata
+                .get("due_date")
+                .and_then(|v| v.as_str())
+                .and_then(|s| NaiveDate::parse_from_str(s, "%Y-%m-%d").ok())
+                .map(|d| d.and_hms_opt(0, 0, 0).unwrap().and_utc());
+
+            // Age from the earlier of invoice date or due date
+            let reference_date = due_date.unwrap_or(txn.date);
+            let days_outstanding = (as_of - reference_date).num_days().max(0);
+
+            let bucket = buckets.get_mut(days_outstanding);
+            bucket.amount += remaining;
+            bucket.count += 1;
+            bucket.invoices.push(ArAgingInvoice {
+                invoice_id: txn.id,
+                invoice_number: txn.number.clone(),
+                customer: txn
+                    .metadata
+                    .get("customer_name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("Unknown")
+                    .to_string(),
+                amount: remaining,
+                days_outstanding,
+                due_date,
+            });
+        }
+
+        Ok(buckets.into_report())
+    }
+}
+
+/// AR aging report.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArAgingReport {
+    pub current: ArAgingBucket,
+    pub days_31_60: ArAgingBucket,
+    pub days_61_90: ArAgingBucket,
+    pub days_90_plus: ArAgingBucket,
+    pub total_outstanding: Decimal,
+}
+
+/// A single aging bucket.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ArAgingBucket {
+    pub amount: Decimal,
+    pub count: u64,
+    pub invoices: Vec<ArAgingInvoice>,
+}
+
+/// An outstanding invoice in the aging report.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArAgingInvoice {
+    pub invoice_id: Uuid,
+    pub invoice_number: String,
+    pub customer: String,
+    pub amount: Decimal,
+    pub days_outstanding: i64,
+    pub due_date: Option<DateTime<Utc>>,
+}
+
+#[derive(Default)]
+struct ArAgingBuckets {
+    current: ArAgingBucket,
+    days_31_60: ArAgingBucket,
+    days_61_90: ArAgingBucket,
+    days_90_plus: ArAgingBucket,
+}
+
+impl ArAgingBuckets {
+    fn get_mut(&mut self, days: i64) -> &mut ArAgingBucket {
+        match days {
+            0..=30 => &mut self.current,
+            31..=60 => &mut self.days_31_60,
+            61..=90 => &mut self.days_61_90,
+            _ => &mut self.days_90_plus,
+        }
+    }
+
+    fn into_report(self) -> ArAgingReport {
+        let total = self.current.amount
+            + self.days_31_60.amount
+            + self.days_61_90.amount
+            + self.days_90_plus.amount;
+
+        ArAgingReport {
+            current: self.current,
+            days_31_60: self.days_31_60,
+            days_61_90: self.days_61_90,
+            days_90_plus: self.days_90_plus,
+            total_outstanding: total,
+        }
+    }
 }
 
 #[async_trait]

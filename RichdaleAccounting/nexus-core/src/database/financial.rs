@@ -258,12 +258,27 @@ pub struct TransactionEntry {
     pub account_id: Uuid,
     /// Entry type (Debit or Credit)
     pub entry_type: EntryType,
-    /// Amount
+    /// Amount (in the entry's transaction currency)
     pub amount: Decimal,
     /// Description/memo
     pub description: String,
     /// Reference number
     pub reference: Option<String>,
+    /// Currency code (ISO 4217, e.g. "USD", "EUR")
+    #[serde(default = "default_currency")]
+    pub currency: String,
+    /// Exchange rate to base currency (1 unit of `currency` = how many base units).
+    /// `None` when the entry is already in base currency.
+    #[serde(default)]
+    pub exchange_rate: Option<Decimal>,
+    /// Amount converted to the base currency. `None` when the entry is already
+    /// in base currency (equals `amount`).
+    #[serde(default)]
+    pub base_currency_amount: Option<Decimal>,
+}
+
+fn default_currency() -> String {
+    "USD".to_string()
 }
 
 impl Default for TransactionEntry {
@@ -275,6 +290,9 @@ impl Default for TransactionEntry {
             amount: dec!(0),
             description: String::new(),
             reference: None,
+            currency: "USD".to_string(),
+            exchange_rate: None,
+            base_currency_amount: None,
         }
     }
 }
@@ -488,9 +506,13 @@ impl Transaction {
         total_debits == total_credits
     }
 
-    /// Get the total amount of the transaction
+    /// Get the total amount of the transaction (sum of debit entries).
+    ///
+    /// For a balanced double-entry transaction, debit total equals credit total,
+    /// so this returns the transaction's monetary value without doubling it.
     pub fn total_amount(&self) -> Decimal {
         self.entries.iter()
+            .filter(|e| e.entry_type == EntryType::Debit)
             .map(|e| e.amount)
             .sum()
     }
@@ -711,7 +733,7 @@ mod tests {
         
         let transaction = Transaction::new("Test transaction".to_string(), Utc::now(), entries);
         assert!(transaction.is_balanced());
-        assert_eq!(transaction.total_amount(), dec!(200));
+        assert_eq!(transaction.total_amount(), dec!(100));
     }
 
     #[test]

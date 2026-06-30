@@ -1,7 +1,6 @@
 import { useState, useEffect } from "react";
 import { Link } from "react-router-dom";
-
-const API = "http://localhost:4000";
+import { apiGet } from "../lib/api";
 
 interface Account {
   id: string;
@@ -18,8 +17,7 @@ function AccountsPage() {
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    fetch(`${API}/api/v1/accounts`)
-      .then((r) => r.json())
+    apiGet<{ success: boolean; data: Account[]; error?: string }>("/api/v1/accounts")
       .then((res) => {
         if (res.success) {
           setAccounts(res.data);

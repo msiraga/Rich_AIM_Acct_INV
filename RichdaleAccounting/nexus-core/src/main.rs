@@ -4,6 +4,7 @@
 
 use nexus_core::{NexusLedger, api::{ApiServer, ApiConfig}};
 use nexus_core::database::Database;
+use nexus_core::database::user::SurrealUserRepository;
 use tracing::{info, Level};
 use tracing_subscriber::{FmtSubscriber, EnvFilter};
 use std::sync::Arc;
@@ -27,26 +28,34 @@ async fn main() -> Result<(), anyhow::Error> {
     // Create the main NexusLedger instance
     let mut nexus = NexusLedger::new();
 
+    // Set up database before initialization so the orchestrator connects it
+    let db = Database::new();
+    nexus.orchestrator.database = Some(db.clone());
+
     // Initialize the system
     nexus.initialize().await?;
 
     info!("NexusLedger initialized successfully!");
     info!("Agents loaded: {}", nexus.orchestrator.agents.read().await.len());
-
-    // Create database connection
-    let db = Database::new();
-    // Note: Database::connect() is called internally during initialization
     info!("Database ready");
 
     // AgentOrchestrator uses Arc internally, so cloning shares state.
-    // We clone it out for the API server while keeping it in nexus for the dispatch loop.
     let orchestrator = Arc::new(Mutex::new(nexus.orchestrator.clone()));
     let nexus = Arc::new(Mutex::new(nexus));
     let db = Arc::new(Mutex::new(db));
 
+    // Create user repository sharing the same DB client
+    let user_repo = Arc::new(SurrealUserRepository::new(db.lock().await.client()));
+
+    // Ensure JWT secret is set (refuse to start with default)
+    if std::env::var("JWT_SECRET").is_err() {
+        info!("JWT_SECRET not set — using development secret. Set JWT_SECRET in production!");
+        std::env::set_var("JWT_SECRET", "dev-secret-key-change-in-production-32b!");
+    }
+
     // Start the API server with axum
     let api_config = ApiConfig::from_env();
-    let api_server = ApiServer::new(api_config, orchestrator, db, nexus);
+    let api_server = ApiServer::new(api_config, orchestrator, db, nexus, user_repo);
 
     info!("Starting API server on {}:{}...", api_server.config.host, api_server.config.port);
     info!("WebSocket chat: ws://{}:{}/ws/chat", api_server.config.host, api_server.config.port);

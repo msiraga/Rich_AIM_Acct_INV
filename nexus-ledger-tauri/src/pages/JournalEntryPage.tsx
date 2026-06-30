@@ -1,6 +1,5 @@
 import { useState, useEffect } from "react";
-
-const API = "http://localhost:4000";
+import { apiGet, apiPost } from "../lib/api";
 
 interface Account {
   id: string;
@@ -28,8 +27,7 @@ function JournalEntryPage() {
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    fetch(`${API}/api/v1/accounts`)
-      .then((r) => r.json())
+    apiGet<{ success: boolean; data: Account[] }>("/api/v1/accounts")
       .then((res) => {
         if (res.success) setAccounts(res.data);
       })
@@ -71,10 +69,9 @@ function JournalEntryPage() {
 
     setSubmitting(true);
     try {
-      const response = await fetch(`${API}/api/v1/transactions`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
+      const res = await apiPost<{ success: boolean; data: { number: string }; error?: string }>(
+        "/api/v1/transactions",
+        {
           description,
           entries: entries.map((e) => ({
             account_id: e.account_id,
@@ -82,9 +79,8 @@ function JournalEntryPage() {
             entry_type: e.entry_type.toLowerCase(),
             description: e.description,
           })),
-        }),
-      });
-      const res = await response.json();
+        },
+      );
       if (res.success) {
         setResult(`Transaction ${res.data.number} created successfully!`);
         setDescription("");

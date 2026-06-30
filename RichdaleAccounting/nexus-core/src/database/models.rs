@@ -151,18 +151,56 @@ impl User {
 }
 
 /// User roles
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum UserRole {
-    /// Administrator with full access
-    Admin,
-    /// Accounting manager
-    Manager,
-    /// Regular user
-    User,
-    /// Read-only user
-    Viewer,
-    /// Guest with limited access
-    Guest,
+    /// Guest with limited access (level 0)
+    Guest = 0,
+    /// Read-only user (level 1)
+    Viewer = 1,
+    /// Regular user — CRUD own data (level 2)
+    User = 2,
+    /// Accounting manager — CRUD all data (level 3)
+    Manager = 3,
+    /// Administrator with full access (level 4)
+    Admin = 4,
+}
+
+impl UserRole {
+    /// Numeric privilege level (higher = more access).
+    pub fn level(&self) -> u8 {
+        match self {
+            Self::Guest => 0,
+            Self::Viewer => 1,
+            Self::User => 2,
+            Self::Manager => 3,
+            Self::Admin => 4,
+        }
+    }
+
+    /// Check if this role is at least the given minimum.
+    pub fn is_at_least(&self, minimum: &UserRole) -> bool {
+        self.level() >= minimum.level()
+    }
+
+    /// Whether this role can read data (Viewer+).
+    pub fn can_read(&self) -> bool {
+        self.is_at_least(&UserRole::Viewer)
+    }
+
+    /// Whether this role can create/update/delete data (User+).
+    pub fn can_write(&self) -> bool {
+        self.is_at_least(&UserRole::User)
+    }
+
+    /// Whether this role can manage all data (Manager+).
+    pub fn can_manage(&self) -> bool {
+        self.is_at_least(&UserRole::Manager)
+    }
+
+    /// Whether this role can administer the system (Admin).
+    pub fn can_administer(&self) -> bool {
+        self.is_at_least(&UserRole::Admin)
+    }
 }
 
 impl Default for UserRole {
