@@ -10,3 +10,5 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 uuid = { version = "1.0", features = ["v4"] }
 tower-http = { version = "0.5", features = ["cors"] }
+nexus-core = { path = "../../RichdaleAccounting/nexus-core" }
+anyhow = "1.0"

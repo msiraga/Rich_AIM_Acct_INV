@@ -2,8 +2,9 @@
 //!
 //! Entry point for the NexusLedger accounting platform.
 
-use nexus_core::{NexusLedger, AgentOrchestrator};
-use tracing::{info, error, Level};
+use nexus_core::{NexusLedger, api::{ApiServer, ApiConfig}};
+use nexus_core::database::Database;
+use tracing::{info, Level};
 use tracing_subscriber::{FmtSubscriber, EnvFilter};
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -15,7 +16,7 @@ async fn main() -> Result<(), anyhow::Error> {
         .with_env_filter(EnvFilter::from_default_env()
             .add_directive(Level::INFO.into()))
         .finish();
-    
+
     tracing::subscriber::set_global_default(subscriber)?;
 
     info!("Starting NexusLedger...");
@@ -25,25 +26,35 @@ async fn main() -> Result<(), anyhow::Error> {
 
     // Create the main NexusLedger instance
     let mut nexus = NexusLedger::new();
-    
+
     // Initialize the system
     nexus.initialize().await?;
-    
+
     info!("NexusLedger initialized successfully!");
     info!("Agents loaded: {}", nexus.orchestrator.agents.read().await.len());
 
-    // Start the agent orchestrator
-    let orchestrator_arc = Arc::new(Mutex::new(nexus.orchestrator));
-    
-    // Here you would typically start the API server, CLI interface, or GUI
-    // For now, we'll just keep the system running
-    info!("System ready. Press Ctrl+C to exit.");
+    // Create database connection
+    let db = Database::new();
+    // Note: Database::connect() is called internally during initialization
+    info!("Database ready");
 
-    // Keep the application running
-    tokio::signal::ctrl_c().await?;
-    
-    info!("Shutting down NexusLedger...");
-    
+    // AgentOrchestrator uses Arc internally, so cloning shares state.
+    // We clone it out for the API server while keeping it in nexus for the dispatch loop.
+    let orchestrator = Arc::new(Mutex::new(nexus.orchestrator.clone()));
+    let nexus = Arc::new(Mutex::new(nexus));
+    let db = Arc::new(Mutex::new(db));
+
+    // Start the API server with axum
+    let api_config = ApiConfig::from_env();
+    let api_server = ApiServer::new(api_config, orchestrator, db, nexus);
+
+    info!("Starting API server on {}:{}...", api_server.config.host, api_server.config.port);
+    info!("WebSocket chat: ws://{}:{}/ws/chat", api_server.config.host, api_server.config.port);
+
+    // Start the server (blocks until shutdown signal)
+    api_server.start().await?;
+
+    info!("NexusLedger shut down cleanly.");
     Ok(())
 }
 

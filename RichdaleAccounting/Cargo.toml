@@ -29,3 +29,8 @@ async-trait = "0.1"
 path-absolutize = "3.0"
 base64 = "0.21"
 regex = "1.0"
+axum = { version = "0.7", features = ["ws"] }
+tower-http = { version = "0.5", features = ["cors"] }
+tower = "0.4"
+tokio-stream = "0.1"
+futures = "0.3"

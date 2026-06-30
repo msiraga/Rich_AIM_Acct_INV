@@ -114,33 +114,33 @@ Last updated: 2026-06-30
 
 ## Phase 3: End-to-End (API + Frontend)
 
-**Status:** Not started (approved to begin)  
-**Started:** —  
-**Completed:** —
+**Status:** ✅ COMPLETED
+**Started:** 2026-06-30
+**Completed:** 2026-06-30
 
 | ID | Task | Status |
 |---|---|---|
-| 3.1 | Implement `ApiServer::start()` — bind axum | [ ] |
-| 3.2 | Implement all API route handlers | [ ] |
-| 3.3 | Add request middleware (ID, timing, error mapping) | [ ] |
-| 3.4 | Replace Tauri backend with nexus-core import | [ ] |
-| 3.5 | Add CORS + graceful shutdown | [ ] |
-| 3.6 | Add react-router to frontend | [ ] |
-| 3.7 | Build Account List page | [ ] |
-| 3.8 | Build Journal Entry form | [ ] |
-| 3.9 | Build Ledger/Transaction List page | [ ] |
-| 3.10 | Build Invoice pages | [ ] |
-| 3.11 | Add error boundaries + loading states | [ ] |
-| 3.12 | E2E test: UI → transaction → ledger | [ ] |
+| 3.1 | Implement `ApiServer::start()` — bind axum | [x] |
+| 3.2 | Implement all API route handlers | [x] |
+| 3.3 | Add request middleware (ID, timing, error mapping) | [x] |
+| 3.4 | Replace Tauri backend with nexus-core import | [x] |
+| 3.5 | Add CORS + graceful shutdown | [x] |
+| 3.6 | Add react-router to frontend | [x] |
+| 3.7 | Build Account List page | [x] |
+| 3.8 | Build Journal Entry form | [x] |
+| 3.9 | Build Ledger/Transaction List page | [x] |
+| 3.10 | Build Invoice pages | [x] |
+| 3.11 | Add error boundaries + loading states | [x] |
+| 3.12 | E2E test: UI → transaction → ledger | [x] |
 
 ### Freeze Token 3
 
 | # | Condition | Status |
 |---|---|---|
-| 🔒 | API server serves real data from SurrealDB | [ ] |
-| 🔒 | Frontend fetches and displays real data | [ ] |
-| 🔒 | User creates transaction via UI → appears in ledger | [ ] |
-| 🔒 | Tauri backend IS nexus-core (no duplicate) | [ ] |
+| 🔒 | API server serves real data from SurrealDB | [x] |
+| 🔒 | Frontend fetches and displays real data | [x] |
+| 🔒 | User creates transaction via UI → appears in ledger | [x] |
+| 🔒 | Tauri backend IS nexus-core (no duplicate) | [x] |
 
 ---
 

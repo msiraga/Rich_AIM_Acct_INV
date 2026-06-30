@@ -99,7 +99,9 @@ Start a new session when:
 
 ## Phase History
 
-| Phase | Commit | Tests | Date |
-|---|---|---|---|
-| 0: Compile & Fix | (pending) | 145 passed | 2026-06-29 |
-| 1: Database & Wire | (pending) | 156 passed | 2026-06-29 |
+| Phase | Commit | Tests | Date | Report |
+|---|---|---|---|---|
+| 0: Compile & Fix | `a767ff2` | 145 passed | 2026-06-29 | [phase-0-completion.md](phase-0-completion.md) |
+| 1: Database & Wire | `a767ff2` | 156 passed | 2026-06-29 | [phase-1-completion.md](phase-1-completion.md) |
+| 2: Real Agent Engine | `b4a97fc` | 200 passed | 2026-06-30 | [phase-2-completion.md](phase-2-completion.md) |
+| 3: End-to-End (API + UI) | (pending commit) | 200+3 e2e | 2026-06-30 | [phase-3-completion.md](phase-3-completion.md) |
