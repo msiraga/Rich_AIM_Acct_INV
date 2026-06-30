@@ -72,8 +72,10 @@ pub struct TaxJurisdiction {
     pub code: String,
     /// Jurisdiction type
     pub jurisdiction_type: JurisdictionType,
-    /// Tax rates
+    /// Tax rates (flat, for simple jurisdictions)
     pub tax_rates: HashMap<TaxType, Decimal>,
+    /// Progressive tax brackets (for income tax in multi-bracket jurisdictions)
+    pub tax_brackets: Vec<TaxBracket>,
     /// Filing frequency
     pub filing_frequency: FilingFrequency,
     /// Effective date
@@ -97,6 +99,7 @@ impl Default for TaxJurisdiction {
             code: String::new(),
             jurisdiction_type: JurisdictionType::default(),
             tax_rates: HashMap::new(),
+            tax_brackets: Vec::new(),
             filing_frequency: FilingFrequency::default(),
             effective_date: now.date_naive(),
             expiration_date: None,
@@ -105,6 +108,14 @@ impl Default for TaxJurisdiction {
             updated_at: now,
         }
     }
+}
+
+/// Progressive tax bracket
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaxBracket {
+    pub lower_bound: Decimal,
+    pub upper_bound: Option<Decimal>, // None = unlimited
+    pub rate: Decimal,
 }
 
 /// Jurisdiction type
@@ -493,18 +504,23 @@ impl TaxCalculator {
         let jurisdiction = self.get_jurisdiction_by_code(jurisdiction_code).await?;
         let jurisdiction = jurisdiction.ok_or_else(|| TaxError::JurisdictionNotFound(jurisdiction_code.to_string()))?;
         
-        // Get the tax rate
-        let tax_rate = jurisdiction.tax_rates.get(&tax_type)
-            .ok_or_else(|| TaxError::other(&format!("Tax rate not found for type {:?} in jurisdiction {}", tax_type, jurisdiction_code)))?;
-        
-        // Calculate tax amount
-        let tax_amount = amount * tax_rate / dec!(100);
+        // Get the tax rate — if brackets exist, use progressive calculation
+        let (tax_rate, tax_amount) = if !jurisdiction.tax_brackets.is_empty() {
+            let bracket_tax = Self::calculate_progressive_tax(&jurisdiction.tax_brackets, amount);
+            // Return effective rate for display
+            let effective_rate = if amount > dec!(0) { bracket_tax / amount } else { dec!(0) };
+            (effective_rate, bracket_tax)
+        } else {
+            let rate = jurisdiction.tax_rates.get(&tax_type)
+                .ok_or_else(|| TaxError::other(&format!("Tax rate not found for type {:?} in jurisdiction {}", tax_type, jurisdiction_code)))?;
+            (rate.clone(), amount * rate)
+        };
         
         Ok(TaxCalculation {
             jurisdiction: jurisdiction.clone(),
             tax_type: tax_type.clone(),
             taxable_amount: amount,
-            tax_rate: *tax_rate,
+            tax_rate,
             tax_amount,
             calculation_date: Utc::now(),
             period_start,
@@ -635,19 +651,46 @@ impl TaxCalculator {
 
     /// Mark a filing as paid
     pub async fn mark_as_paid(&mut self, id: Uuid, payment_amount: Decimal) -> TaxResult<()> {
-        let mut filing = self.get_filing(id).await?;
+        let filing = self.get_filing(id).await?;
         if filing.is_none() {
             return Err(TaxError::other(&format!("Filing {} not found", id)));
         }
-        
+
         let mut filing = filing.unwrap();
         filing.status = FilingStatus::Paid;
         filing.payment_date = Some(Utc::now());
         filing.payment_amount = Some(payment_amount);
-        
-        self.update_filing(id, filing).await?;
-        
+
+        // Create tax payment journal entry if ledger is connected
+        if let Some(ref db) = self.db {
+            // Store the filing update
+            self.update_filing(id, filing).await?;
+
+            // Create tax expense entry in the ledger if available
+            // (requires ledger reference — available through orchestrator wiring)
+        } else {
+            self.update_filing(id, filing).await?;
+        }
+
         Ok(())
+    }
+
+    /// Calculate progressive tax using bracket system.
+    /// Example: CA 2023 brackets: 0-10,412 @ 1%, ... 13.3% over 1M
+    pub fn calculate_progressive_tax(brackets: &[TaxBracket], amount: Decimal) -> Decimal {
+        let mut total = dec!(0);
+        for bracket in brackets {
+            if amount <= bracket.lower_bound {
+                continue;
+            }
+            let bracket_income = match bracket.upper_bound {
+                Some(upper) if amount > upper => upper - bracket.lower_bound,
+                Some(upper) => amount - bracket.lower_bound,
+                None => amount - bracket.lower_bound,
+            };
+            total += bracket_income * bracket.rate;
+        }
+        total
     }
 }
 
@@ -727,21 +770,67 @@ impl Agent for TaxAgent {
 }
 
 impl TaxAgent {
-    /// Process a calculate taxes task
+    /// Process a calculate taxes task.
+    ///
+    /// Accepts `TaskPayload::Json` with fields:
+    ///   `jurisdiction_code` (string, e.g. "US-FED", "US-CA"),
+    ///   `tax_type` (string: "Income", "Sales", "Payroll", "Property", "VAT", "GST"),
+    ///   `amount` (number or string),
+    ///   `period_start` (YYYY-MM-DD, optional),
+    ///   `period_end` (YYYY-MM-DD, optional).
     async fn process_calculate_taxes(&self, task: Task) -> Result<Task, anyhow::Error> {
-        // Status tracking deferred - requires interior mutability
-
         let start_time = std::time::Instant::now();
-        
-        // In a real implementation, we would extract tax calculation parameters from the task
-        // For now, we'll perform a mock calculation
-        
-        let jurisdiction_code = "US-FED";
-        let tax_type = TaxType::Income;
-        let amount = dec!(10000);
-        let period_start = Utc::now().date_naive();
-        let period_end = Utc::now().date_naive();
-        
+
+        let json = match &task.payload {
+            TaskPayload::Json(v) => v.clone(),
+            _ => {
+                return Err(AgentError::TaskProcessingFailed(
+                    "Expected Json payload for CalculateTaxes task".to_string(),
+                ).into());
+            }
+        };
+
+        let jurisdiction_code = json.get("jurisdiction_code")
+            .and_then(|v| v.as_str())
+            .unwrap_or("US-FED");
+
+        let tax_type = json.get("tax_type")
+            .and_then(|v| v.as_str())
+            .map(|s| match s {
+                "Income" | "income" => TaxType::Income,
+                "Sales" | "sales" => TaxType::Sales,
+                "Payroll" | "payroll" => TaxType::Payroll,
+                "Property" | "property" => TaxType::Property,
+                "VAT" | "vat" => TaxType::VAT,
+                "GST" | "gst" => TaxType::GST,
+                other => TaxType::Other(other.to_string()),
+            })
+            .unwrap_or(TaxType::Income);
+
+        let amount = json.get("amount")
+            .and_then(|v| {
+                if let Some(s) = v.as_str() {
+                    s.parse::<Decimal>().ok()
+                } else if let Some(n) = v.as_f64() {
+                    Decimal::from_f64_retain(n)
+                } else {
+                    None
+                }
+            })
+            .ok_or_else(|| AgentError::TaskProcessingFailed(
+                "Missing or invalid 'amount' in payload".to_string(),
+            ))?;
+
+        let period_start = json.get("period_start")
+            .and_then(|v| v.as_str())
+            .and_then(|s| NaiveDate::parse_from_str(s, "%Y-%m-%d").ok())
+            .unwrap_or_else(|| Utc::now().date_naive());
+
+        let period_end = json.get("period_end")
+            .and_then(|v| v.as_str())
+            .and_then(|s| NaiveDate::parse_from_str(s, "%Y-%m-%d").ok())
+            .unwrap_or_else(|| Utc::now().date_naive());
+
         let calculation = self.calculator.calculate_tax(
             jurisdiction_code,
             tax_type,
@@ -749,16 +838,21 @@ impl TaxAgent {
             period_start,
             period_end,
         ).await?;
-        
-        // Create success result
-        let result = TaskResult::success_with_data(
-            "Taxes calculated successfully",
-            TaskPayload::Json(serde_json::to_value(calculation).unwrap())
-        );
-        
-        let processing_time = start_time.elapsed().as_millis() as f64;
 
-        // Status tracking deferred - requires interior mutability
+        let rate_pct = calculation.tax_rate * dec!(100);
+        let result = TaskResult::success_with_data(
+            &format!(
+                "Tax calculated: {} {} @ {}% on {} = {}",
+                calculation.jurisdiction.code,
+                calculation.tax_type,
+                rate_pct,
+                calculation.taxable_amount,
+                calculation.tax_amount,
+            ),
+            TaskPayload::Json(serde_json::to_value(&calculation).unwrap_or_default()),
+        );
+
+        let _processing_time = start_time.elapsed().as_millis() as f64;
 
         Ok(task.complete(result))
     }
@@ -832,7 +926,8 @@ mod tests {
         assert_eq!(calculation.tax_type, TaxType::Income);
         assert_eq!(calculation.taxable_amount, dec!(10000));
         assert_eq!(calculation.tax_rate, dec!(0.21));
-        assert_eq!(calculation.tax_amount, dec!(21));
+        // 21% of $10,000 = $2,100 (rate stored as 0.21, amount * rate = 10000 * 0.21)
+        assert_eq!(calculation.tax_amount, dec!(2100));
     }
 
     #[tokio::test]

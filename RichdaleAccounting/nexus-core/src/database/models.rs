@@ -347,6 +347,10 @@ pub struct AuditLog {
     pub success: bool,
     /// Error message if any
     pub error_message: Option<String>,
+    /// Previous entry hash (SHA-256, hex-encoded) — forms an immutable chain
+    pub prev_hash: Option<String>,
+    /// Hash of this entry (SHA-256 of canonical JSON)
+    pub chain_hash: Option<String>,
 }
 
 impl Default for AuditLog {
@@ -364,6 +368,8 @@ impl Default for AuditLog {
             user_agent: None,
             success: true,
             error_message: None,
+            prev_hash: None,
+            chain_hash: None,
         }
     }
 }

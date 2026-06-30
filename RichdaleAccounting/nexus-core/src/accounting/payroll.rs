@@ -91,6 +91,22 @@ pub struct Employee {
     pub tax_info: TaxInformation,
     /// Direct deposit information
     pub direct_deposit: Option<DirectDeposit>,
+    /// Pre-tax deductions (e.g. 401k, health insurance, HSA, FSA)
+    pub pre_tax_deductions: Vec<PreTaxDeduction>,
+    /// YTD gross wages
+    pub ytd_gross: Decimal,
+    /// YTD federal tax withheld
+    pub ytd_federal_tax: Decimal,
+    /// YTD social security wages
+    pub ytd_ss_wages: Decimal,
+    /// YTD social security tax
+    pub ytd_ss_tax: Decimal,
+    /// YTD medicare wages
+    pub ytd_medicare_wages: Decimal,
+    /// YTD medicare tax
+    pub ytd_medicare_tax: Decimal,
+    /// YTD retirement contributions
+    pub ytd_retirement: Decimal,
     /// Created timestamp
     pub created_at: DateTime<Utc>,
     /// Updated timestamp
@@ -115,6 +131,14 @@ impl Default for Employee {
             currency: "USD".to_string(),
             tax_info: TaxInformation::default(),
             direct_deposit: None,
+            pre_tax_deductions: Vec::new(),
+            ytd_gross: dec!(0),
+            ytd_federal_tax: dec!(0),
+            ytd_ss_wages: dec!(0),
+            ytd_ss_tax: dec!(0),
+            ytd_medicare_wages: dec!(0),
+            ytd_medicare_tax: dec!(0),
+            ytd_retirement: dec!(0),
             created_at: now,
             updated_at: now,
         }
@@ -221,6 +245,39 @@ pub enum FilingStatus {
 impl Default for FilingStatus {
     fn default() -> Self {
         Self::Single
+    }
+}
+
+/// Pre-tax deduction model (401k, health insurance, HSA, FSA, commuter)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PreTaxDeduction {
+    pub deduction_type: DeductionType,
+    pub amount: Decimal,
+    pub annual_limit: Option<Decimal>,
+    pub ytd_amount: Decimal,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub enum DeductionType {
+    HealthInsurance,
+    DentalInsurance,
+    VisionInsurance,
+    Traditional401k,
+    HSA,
+    FSA,
+    DependentCare,
+    Commuter,
+    Other(String),
+}
+
+impl Default for PreTaxDeduction {
+    fn default() -> Self {
+        Self {
+            deduction_type: DeductionType::HealthInsurance,
+            amount: dec!(0),
+            annual_limit: None,
+            ytd_amount: dec!(0),
+        }
     }
 }
 
@@ -378,6 +435,8 @@ pub struct PayrollProcessor {
     pub current_pay_period: Arc<Mutex<Option<PayPeriod>>>,
     /// Optional SurrealDB connection for persistence
     pub db: Option<Arc<crate::database::Database>>,
+    /// Optional ledger for resolving real account references in payroll transactions
+    pub ledger: Option<Arc<crate::accounting::ledger::Ledger>>,
 }
 
 impl Default for PayrollProcessor {
@@ -395,16 +454,63 @@ impl PayrollProcessor {
             time_entries: Arc::new(RwLock::new(BTreeMap::new())),
             current_pay_period: Arc::new(Mutex::new(None)),
             db: None,
+            ledger: None,
         }
+    }
+
+    /// Create payroll-specific liability accounts in the ledger if they don't exist.
+    /// Called during initialization when a ledger is connected.
+    async fn ensure_payroll_accounts(&self) -> PayrollResult<()> {
+        let ledger = match &self.ledger {
+            Some(l) => l,
+            None => return Ok(()),
+        };
+
+        let accounts_to_create = vec![
+            ("2030", "Federal Tax Payable", AccountType::Liability),
+            ("2040", "State Tax Payable", AccountType::Liability),
+            ("2050", "Social Security Payable", AccountType::Liability),
+            ("2060", "Medicare Payable", AccountType::Liability),
+            ("2070", "Retirement Payable", AccountType::Liability),
+        ];
+
+        // Need mutable access to create accounts — use a fresh Ledger clone
+        // Since Ledger's internal state is Arc<RwLock<>>, we can create accounts
+        // through a Ledger with the same Arc references.
+        for (number, name, acct_type) in accounts_to_create {
+            if ledger.get_account_by_number(number).await
+                .map_err(|e| PayrollError::other(&e.to_string()))?.is_none()
+            {
+                // Account doesn't exist — we need to create it.
+                // We'll use a helper Ledger that shares the same Arc internals.
+                let mut helper = crate::accounting::ledger::Ledger {
+                    accounts: ledger.accounts.clone(),
+                    transactions: ledger.transactions.clone(),
+                    journal_entries: ledger.journal_entries.clone(),
+                    current_journal_number: ledger.current_journal_number.clone(),
+                    current_transaction_number: ledger.current_transaction_number.clone(),
+                    db: ledger.db.clone(),
+                };
+                helper.create_account(Account::new(number, name, acct_type))
+                    .await
+                    .map_err(|e| PayrollError::other(&format!("Failed to create account {}: {}", number, e)))?;
+                info!("Created payroll account: {} {}", number, name);
+            }
+        }
+
+        Ok(())
     }
 
     /// Initialize the payroll processor
     pub async fn initialize(&mut self) -> PayrollResult<()> {
         info!("Initializing Payroll Processor...");
-        
+
         // Create current pay period
         self.create_current_pay_period().await?;
-        
+
+        // Create payroll liability accounts if a ledger is connected
+        self.ensure_payroll_accounts().await?;
+
         Ok(())
     }
 
@@ -743,94 +849,116 @@ impl PayrollProcessor {
         Ok(calculations)
     }
 
-    /// Generate payroll transactions
+    /// Generate payroll transactions using real account references from the ledger.
+    ///
+    /// Account mapping:
+    ///   Dr. Salaries Expense (5010)     — gross pay
+    ///   Cr. Federal Tax Payable (2030)  — federal withholding
+    ///   Cr. State Tax Payable (2040)    — state withholding
+    ///   Cr. Accrued Expenses (2020)     — local tax
+    ///   Cr. Social Security Payable (2050)
+    ///   Cr. Medicare Payable (2060)
+    ///   Cr. Retirement Payable (2070)
+    ///   Cr. Cash (1000)                 — net pay
     pub async fn generate_payroll_transactions(
         &self,
         pay_period_id: Uuid,
         calculations: Vec<PayrollCalculation>,
     ) -> PayrollResult<Vec<Transaction>> {
         info!("Generating payroll transactions for pay period {}", pay_period_id);
-        
+
+        // Resolve account IDs from ledger, falling back to placeholder UUIDs
+        let salaries_id = if let Some(ref ledger) = self.ledger {
+            ledger.get_account_by_number("5010").await.ok().flatten().map(|a| a.id).unwrap_or_else(Uuid::new_v4)
+        } else { Uuid::new_v4() };
+        let fed_tax_id = if let Some(ref ledger) = self.ledger {
+            ledger.get_account_by_number("2030").await.ok().flatten().map(|a| a.id).unwrap_or_else(Uuid::new_v4)
+        } else { Uuid::new_v4() };
+        let state_tax_id = if let Some(ref ledger) = self.ledger {
+            ledger.get_account_by_number("2040").await.ok().flatten().map(|a| a.id).unwrap_or_else(Uuid::new_v4)
+        } else { Uuid::new_v4() };
+        let local_tax_id = if let Some(ref ledger) = self.ledger {
+            ledger.get_account_by_number("2020").await.ok().flatten().map(|a| a.id).unwrap_or_else(Uuid::new_v4)
+        } else { Uuid::new_v4() };
+        let ss_id = if let Some(ref ledger) = self.ledger {
+            ledger.get_account_by_number("2050").await.ok().flatten().map(|a| a.id).unwrap_or_else(Uuid::new_v4)
+        } else { Uuid::new_v4() };
+        let medicare_id = if let Some(ref ledger) = self.ledger {
+            ledger.get_account_by_number("2060").await.ok().flatten().map(|a| a.id).unwrap_or_else(Uuid::new_v4)
+        } else { Uuid::new_v4() };
+        let retirement_id = if let Some(ref ledger) = self.ledger {
+            ledger.get_account_by_number("2070").await.ok().flatten().map(|a| a.id).unwrap_or_else(Uuid::new_v4)
+        } else { Uuid::new_v4() };
+        let cash_id = if let Some(ref ledger) = self.ledger {
+            ledger.get_account_by_number("1000").await.ok().flatten().map(|a| a.id).unwrap_or_else(Uuid::new_v4)
+        } else { Uuid::new_v4() };
+
         let mut transactions = Vec::new();
-        
+
         for calculation in calculations {
-            // Create a transaction for each payroll calculation
             let mut entries = Vec::new();
-            
-            // Debit: Salaries Expense (gross pay)
+
             entries.push(TransactionEntry::new(
-                Uuid::new_v4(), // In real implementation, this would be the salaries expense account
-                EntryType::Debit,
-                calculation.gross_pay,
+                salaries_id, EntryType::Debit, calculation.gross_pay,
                 &format!("Gross pay for employee {}", calculation.employee_id),
             ));
-            
-            // Credit: Federal Tax Payable
+
+            if calculation.federal_tax > dec!(0) {
+                entries.push(TransactionEntry::new(
+                    fed_tax_id, EntryType::Credit, calculation.federal_tax,
+                    &format!("Federal tax for employee {}", calculation.employee_id),
+                ));
+            }
+
+            if calculation.state_tax > dec!(0) {
+                entries.push(TransactionEntry::new(
+                    state_tax_id, EntryType::Credit, calculation.state_tax,
+                    &format!("State tax for employee {}", calculation.employee_id),
+                ));
+            }
+
+            if calculation.local_tax > dec!(0) {
+                entries.push(TransactionEntry::new(
+                    local_tax_id, EntryType::Credit, calculation.local_tax,
+                    &format!("Local tax for employee {}", calculation.employee_id),
+                ));
+            }
+
+            if calculation.social_security > dec!(0) {
+                entries.push(TransactionEntry::new(
+                    ss_id, EntryType::Credit, calculation.social_security,
+                    &format!("Social security for employee {}", calculation.employee_id),
+                ));
+            }
+
+            if calculation.medicare > dec!(0) {
+                entries.push(TransactionEntry::new(
+                    medicare_id, EntryType::Credit, calculation.medicare,
+                    &format!("Medicare for employee {}", calculation.employee_id),
+                ));
+            }
+
+            if calculation.retirement > dec!(0) {
+                entries.push(TransactionEntry::new(
+                    retirement_id, EntryType::Credit, calculation.retirement,
+                    &format!("Retirement for employee {}", calculation.employee_id),
+                ));
+            }
+
             entries.push(TransactionEntry::new(
-                Uuid::new_v4(), // Federal tax payable account
-                EntryType::Credit,
-                calculation.federal_tax,
-                &format!("Federal tax for employee {}", calculation.employee_id),
-            ));
-            
-            // Credit: State Tax Payable
-            entries.push(TransactionEntry::new(
-                Uuid::new_v4(), // State tax payable account
-                EntryType::Credit,
-                calculation.state_tax,
-                &format!("State tax for employee {}", calculation.employee_id),
-            ));
-            
-            // Credit: Local Tax Payable
-            entries.push(TransactionEntry::new(
-                Uuid::new_v4(), // Local tax payable account
-                EntryType::Credit,
-                calculation.local_tax,
-                &format!("Local tax for employee {}", calculation.employee_id),
-            ));
-            
-            // Credit: Social Security Payable
-            entries.push(TransactionEntry::new(
-                Uuid::new_v4(), // Social security payable account
-                EntryType::Credit,
-                calculation.social_security,
-                &format!("Social security for employee {}", calculation.employee_id),
-            ));
-            
-            // Credit: Medicare Payable
-            entries.push(TransactionEntry::new(
-                Uuid::new_v4(), // Medicare payable account
-                EntryType::Credit,
-                calculation.medicare,
-                &format!("Medicare for employee {}", calculation.employee_id),
-            ));
-            
-            // Credit: Retirement Payable
-            entries.push(TransactionEntry::new(
-                Uuid::new_v4(), // Retirement payable account
-                EntryType::Credit,
-                calculation.retirement,
-                &format!("Retirement for employee {}", calculation.employee_id),
-            ));
-            
-            // Credit: Cash (net pay)
-            entries.push(TransactionEntry::new(
-                Uuid::new_v4(), // Cash account
-                EntryType::Credit,
-                calculation.net_pay,
+                cash_id, EntryType::Credit, calculation.net_pay,
                 &format!("Net pay for employee {}", calculation.employee_id),
             ));
-            
-            // Create the transaction
+
             let transaction = Transaction::new(
                 format!("Payroll for employee {} - Period {}", calculation.employee_id, pay_period_id),
                 Utc::now(),
                 entries,
             );
-            
+
             transactions.push(transaction);
         }
-        
+
         Ok(transactions)
     }
 }
@@ -911,34 +1039,115 @@ impl Agent for PayrollAgent {
 }
 
 impl PayrollAgent {
-    /// Process a calculate payroll task
+    /// Process a calculate payroll task.
+    ///
+    /// Accepts `TaskPayload::Json` with optional fields:
+    ///   `employee_id` (string, UUID) — calculate for a single employee;
+    ///     if omitted, processes all active employees in the current pay period.
+    ///   `pay_period_id` (string, UUID) — specific pay period;
+    ///     if omitted, uses the current pay period.
     async fn process_calculate_payroll(&self, task: Task) -> Result<Task, anyhow::Error> {
-        // Status tracking deferred - requires interior mutability
-
         let start_time = std::time::Instant::now();
-        
-        // In a real implementation, we would extract payroll calculation parameters from the task
-        // For now, we'll perform a mock calculation
-        
-        // Get the current pay period
-        let current_pay_period = self.processor.current_pay_period.lock().await;
-        let pay_period_id = current_pay_period.as_ref().map(|p| p.id).unwrap_or(Uuid::new_v4());
-        
-        // Process payroll
-        let calculations = self.processor.process_payroll(pay_period_id).await?;
-        
-        // Generate transactions
-        let transactions = self.processor.generate_payroll_transactions(pay_period_id, calculations).await?;
-        
-        // Create success result
-        let result = TaskResult::success_with_data(
-            "Payroll calculated successfully",
-            TaskPayload::Json(serde_json::to_value(transactions).unwrap())
-        );
-        
-        let processing_time = start_time.elapsed().as_millis() as f64;
 
-        // Status tracking deferred - requires interior mutability
+        // Extract optional parameters from payload
+        let (employee_id_filter, pay_period_id) = match &task.payload {
+            TaskPayload::Json(json) => {
+                let emp_id = json.get("employee_id")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| Uuid::parse_str(s).ok());
+
+                let pp_id = json.get("pay_period_id")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| Uuid::parse_str(s).ok());
+
+                (emp_id, pp_id)
+            }
+            _ => (None, None),
+        };
+
+        // Resolve pay period
+        let pay_period_id = match pay_period_id {
+            Some(id) => id,
+            None => {
+                let current_pay_period = self.processor.current_pay_period.lock().await;
+                current_pay_period.as_ref()
+                    .map(|p| p.id)
+                    .ok_or_else(|| AgentError::TaskProcessingFailed(
+                        "No pay period specified and no current pay period set".to_string()
+                    ))?
+            }
+        };
+
+        // Calculate payroll
+        let calculations = if let Some(emp_id) = employee_id_filter {
+            // Single employee
+            let calc = self.processor.calculate_payroll(emp_id, pay_period_id).await?;
+            vec![calc]
+        } else {
+            // All active employees
+            self.processor.process_payroll(pay_period_id).await?
+        };
+
+        if calculations.is_empty() {
+            let result = TaskResult::success("No active employees to process for this pay period");
+            return Ok(task.complete(result));
+        }
+
+        // Generate transactions
+        let transactions = self.processor
+            .generate_payroll_transactions(pay_period_id, calculations.clone())
+            .await?;
+
+        // Actually record each transaction to the shared ledger
+        let mut recorded_ids = Vec::new();
+        if let Some(ref ledger) = self.processor.ledger {
+            for txn in &transactions {
+                match ledger.record_transaction(txn.clone()).await {
+                    Ok(recorded) => {
+                        info!("Recorded payroll transaction {} to ledger", recorded.number);
+                        recorded_ids.push(recorded.id);
+                    }
+                    Err(e) => {
+                        warn!("Failed to record payroll transaction to ledger: {}", e);
+                    }
+                }
+            }
+        }
+
+        let total_gross: Decimal = calculations.iter().map(|c| c.gross_pay).sum();
+        let total_net: Decimal = calculations.iter().map(|c| c.net_pay).sum();
+        let employee_count = calculations.len();
+
+        let result_data = serde_json::json!({
+            "employee_count": employee_count,
+            "total_gross_pay": total_gross.to_string(),
+            "total_net_pay": total_net.to_string(),
+            "calculations": calculations.iter().map(|c| serde_json::json!({
+                "employee_id": c.employee_id.to_string(),
+                "gross_pay": c.gross_pay.to_string(),
+                "net_pay": c.net_pay.to_string(),
+                "federal_tax": c.federal_tax.to_string(),
+                "state_tax": c.state_tax.to_string(),
+                "social_security": c.social_security.to_string(),
+                "medicare": c.medicare.to_string(),
+                "total_deductions": c.total_deductions.to_string(),
+            })).collect::<Vec<_>>(),
+            "transactions": transactions.iter().map(|t| serde_json::json!({
+                "id": t.id.to_string(),
+                "description": t.description,
+            })).collect::<Vec<_>>(),
+            "recorded_transaction_ids": recorded_ids.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
+        });
+
+        let result = TaskResult::success_with_data(
+            &format!(
+                "Payroll processed: {} employees, gross={}, net={}",
+                employee_count, total_gross, total_net
+            ),
+            TaskPayload::Json(result_data),
+        );
+
+        let _processing_time = start_time.elapsed().as_millis() as f64;
 
         Ok(task.complete(result))
     }

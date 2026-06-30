@@ -1,7 +1,7 @@
 # NexusLedger — Execution Tracker
 
 **Track progress automatically.** Check off tasks as completed.  
-Last updated: 2026-06-29
+Last updated: 2026-06-30
 
 ---
 
@@ -83,38 +83,38 @@ Last updated: 2026-06-29
 
 ## Phase 2: Real Agent Engine
 
-**Status:** Not started (approved to begin)
-**Started:** —  
-**Completed:** —
+**Status:** ✅ COMPLETED
+**Started:** 2026-06-30
+**Completed:** 2026-06-30
 
 | ID | Task | Status |
 |---|---|---|
-| 2.1 | Real `LedgerAgent.process_task()` | [ ] |
-| 2.2 | Real `ReconciliationAgent.process_task()` | [ ] |
-| 2.3 | Real `TaxAgent.process_task()` | [ ] |
-| 2.4 | Real `PayrollAgent.process_task()` | [ ] |
-| 2.5 | Create `InvoiceAgent` (new struct + process_task) | [ ] |
-| 2.6 | Create `ReceiptAgent` (new struct + process_task) | [ ] |
-| 2.7 | Create `ReportingAgent` (new struct, P&L/BS/IS) | [ ] |
-| 2.8 | Real `AuditAgent.process_task()` | [ ] |
-| 2.9 | Real `DocumentAgent.process_task()` | [ ] |
-| 2.10 | Real event-driven task dispatch loop | [ ] |
-| 2.11 | Integration test: submit task → process → verify in DB | [ ] |
+| 2.1 | Real `LedgerAgent.process_task()` | [x] |
+| 2.2 | Real `ReconciliationAgent.process_task()` | [x] |
+| 2.3 | Real `TaxAgent.process_task()` | [x] |
+| 2.4 | Real `PayrollAgent.process_task()` | [x] |
+| 2.5 | Create `InvoiceAgent` (new struct + process_task) | [x] |
+| 2.6 | Create `ReceiptAgent` (new struct + process_task) | [x] |
+| 2.7 | Create `ReportingAgent` (new struct, P&L/BS/IS) | [x] |
+| 2.8 | Real `AuditAgent.process_task()` | [x] |
+| 2.9 | Real `DocumentAgent.process_task()` | [x] |
+| 2.10 | Real event-driven task dispatch loop | [x] |
+| 2.11 | Integration test: submit task → process → verify in DB | [x] |
 
 ### Freeze Token 2
 
 | # | Condition | Status |
 |---|---|---|
-| 🔒 | All 9 agents process real tasks (no mock returns) | [ ] |
-| 🔒 | InvoiceAgent and ReceiptAgent exist and work | [ ] |
-| 🔒 | Task queue dispatches to correct agent type | [ ] |
-| 🔒 | Integration test: transaction → DB verified | [ ] |
+| 🔒 | All 9 agents process real tasks (no mock returns) | [x] |
+| 🔒 | InvoiceAgent and ReceiptAgent exist and work | [x] |
+| 🔒 | Task queue dispatches to correct agent type | [x] |
+| 🔒 | Integration test: transaction → DB verified | [x] |
 
 ---
 
 ## Phase 3: End-to-End (API + Frontend)
 
-**Status:** Not started (blocked by P2)  
+**Status:** Not started (approved to begin)  
 **Started:** —  
 **Completed:** —
 

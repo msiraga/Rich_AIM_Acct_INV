@@ -105,13 +105,20 @@ impl Ledger {
         }
     }
 
-    /// Initialize the ledger with default accounts
+    /// Initialize the ledger with default accounts.
+    /// Idempotent — skips if accounts already exist (e.g. shared via Arc).
     pub async fn initialize(&mut self) -> LedgerResult<()> {
         info!("Initializing ledger with default accounts...");
-        
+
+        // Skip if accounts already exist (e.g. from a shared Arc)
+        if !self.accounts.read().await.is_empty() {
+            info!("Ledger already has {} accounts, skipping initialization", self.accounts.read().await.len());
+            return Ok(());
+        }
+
         // Create default chart of accounts
         self.create_default_accounts().await?;
-        
+
         Ok(())
     }
 

@@ -285,6 +285,8 @@ impl SurrealAuditRepository {
             user_agent,
             success,
             error_message,
+            prev_hash: None,
+            chain_hash: None,
         })
     }
 }
@@ -384,6 +386,7 @@ impl AuditLogger {
             user_agent: None,
             success: true,
             error_message: None,
+            ..Default::default()
         };
         
         self.repository.log(log).await?;
@@ -405,6 +408,7 @@ impl AuditLogger {
             user_agent: None,
             success: true,
             error_message: None,
+            ..Default::default()
         };
         
         self.repository.log(log).await?;
@@ -426,6 +430,7 @@ impl AuditLogger {
             user_agent: None,
             success: true,
             error_message: None,
+            ..Default::default()
         };
         
         self.repository.log(log).await?;
@@ -447,6 +452,7 @@ impl AuditLogger {
             user_agent: None,
             success: false,
             error_message: Some(error.to_string()),
+            ..Default::default()
         };
         
         self.repository.log(log).await?;

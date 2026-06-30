@@ -182,6 +182,76 @@ impl Task {
         }
     }
 
+    /// Create an invoice generation task
+    pub fn generate_invoice(invoice_data: serde_json::Value) -> Self {
+        Self {
+            task_type: TaskType::GenerateInvoice,
+            payload: TaskPayload::Json(invoice_data),
+            assigned_agent_type: Some(AgentType::InvoiceAgent),
+            ..Default::default()
+        }
+    }
+
+    /// Create a payment processing task
+    pub fn process_payment(payment_data: serde_json::Value) -> Self {
+        Self {
+            task_type: TaskType::ProcessPayment,
+            payload: TaskPayload::Json(payment_data),
+            assigned_agent_type: Some(AgentType::InvoiceAgent),
+            ..Default::default()
+        }
+    }
+
+    /// Create a receipt processing task
+    pub fn process_receipt(receipt_data: serde_json::Value) -> Self {
+        Self {
+            task_type: TaskType::ProcessReceipt,
+            payload: TaskPayload::Json(receipt_data),
+            assigned_agent_type: Some(AgentType::ReceiptAgent),
+            ..Default::default()
+        }
+    }
+
+    /// Create a report generation task
+    pub fn generate_report(report_type: &str) -> Self {
+        Self {
+            task_type: TaskType::GenerateReport,
+            payload: TaskPayload::Json(serde_json::json!({ "report_type": report_type })),
+            assigned_agent_type: Some(AgentType::ReportingAgent),
+            ..Default::default()
+        }
+    }
+
+    /// Create a tax calculation task
+    pub fn calculate_taxes(tax_data: serde_json::Value) -> Self {
+        Self {
+            task_type: TaskType::CalculateTaxes,
+            payload: TaskPayload::Json(tax_data),
+            assigned_agent_type: Some(AgentType::TaxAgent),
+            ..Default::default()
+        }
+    }
+
+    /// Create a payroll calculation task
+    pub fn calculate_payroll(payroll_data: serde_json::Value) -> Self {
+        Self {
+            task_type: TaskType::CalculatePayroll,
+            payload: TaskPayload::Json(payroll_data),
+            assigned_agent_type: Some(AgentType::PayrollAgent),
+            ..Default::default()
+        }
+    }
+
+    /// Create an audit check task
+    pub fn audit_check(audit_data: serde_json::Value) -> Self {
+        Self {
+            task_type: TaskType::AuditCheck,
+            payload: TaskPayload::Json(audit_data),
+            assigned_agent_type: Some(AgentType::AuditAgent),
+            ..Default::default()
+        }
+    }
+
     /// Mark the task as completed with a result
     pub fn complete(mut self, result: TaskResult) -> Self {
         self.status = TaskStatus::Completed;

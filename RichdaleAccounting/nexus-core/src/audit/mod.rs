@@ -14,6 +14,41 @@ use crate::agents::agent_types::{Agent, AgentConfig, AgentType, AgentStatus};
 use crate::agents::task::{Task, TaskResult, TaskPayload};
 use crate::agents::error::AgentError;
 
+/// Compute SHA-256 hash of an audit entry for tamper-proof chaining.
+fn compute_audit_hash(entry: &AuditLog, prev_hash: Option<&str>) -> String {
+    use sha2::{Sha256, Digest};
+    let mut hasher = Sha256::new();
+    hasher.update(entry.id.to_string());
+    hasher.update(&entry.entity_type);
+    hasher.update(&entry.entity_id);
+    hasher.update(format!("{:?}", entry.action));
+    hasher.update(entry.timestamp.to_rfc3339());
+    if let Some(ref old) = entry.old_values {
+        hasher.update(old.to_string());
+    }
+    if let Some(ref new) = entry.new_values {
+        hasher.update(new.to_string());
+    }
+    if let Some(prev) = prev_hash {
+        hasher.update(prev);
+    }
+    hex::encode(hasher.finalize())
+}
+
+/// Log with hash-chaining: each entry links to the previous via SHA-256.
+async fn log_with_chain(
+    repository: &Arc<dyn AuditRepository>,
+    mut entry: AuditLog,
+) -> Result<(), anyhow::Error> {
+    // Get the previous entry's hash for chain linking
+    let all_logs = repository.list_all().await?;
+    let prev_hash = all_logs.last().and_then(|e| e.chain_hash.clone());
+    entry.prev_hash = prev_hash.clone();
+    entry.chain_hash = Some(compute_audit_hash(&entry, prev_hash.as_deref()));
+    repository.log(entry).await?;
+    Ok(())
+}
+
 /// Audit Agent for handling audit-related tasks
 #[derive(Clone)]
 pub struct AuditAgent {
@@ -96,41 +131,123 @@ impl Agent for AuditAgent {
 }
 
 impl AuditAgent {
-    /// Process an audit check task
+    /// Process an audit check task.
+    ///
+    /// Accepts `TaskPayload::Json` with fields:
+    ///   `entity_type` (string, e.g. "transaction", "account"),
+    ///   `entity_id` (string),
+    ///   `action` (string: "Create", "Update", "Delete", "Read", or custom),
+    ///   `user_id` (string UUID, optional),
+    ///   `old_values` (JSON object, optional),
+    ///   `new_values` (JSON object, optional).
+    ///
+    /// If the payload is `Empty`, performs a system-level audit check.
     async fn process_audit_check(&self, task: Task) -> Result<Task, anyhow::Error> {
-        // Status tracking deferred - requires interior mutability
-
         let start_time = std::time::Instant::now();
-        
-        // In a real implementation, we would extract audit parameters from the task
-        // For now, we'll perform a mock audit check
-        
-        // Log an audit entry
-        let audit_log = AuditLog {
-            id: Uuid::new_v4(),
-            user_id: None,
-            action: AuditAction::Custom("Audit check performed".to_string()),
-            entity_type: "system".to_string(),
-            entity_id: "all".to_string(),
-            old_values: None,
-            new_values: None,
-            timestamp: Utc::now(),
-            ip_address: None,
-            user_agent: None,
-            success: true,
-            error_message: None,
-        };
-        
-        self.repository.log(audit_log).await?;
-        
-        // Create success result
-        let result = TaskResult::success("Audit check completed successfully");
-        
-        let _processing_time = start_time.elapsed().as_millis() as f64;
 
-        // Status tracking deferred
+        match &task.payload {
+            TaskPayload::Json(json) => {
+                let entity_type = json.get("entity_type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
+                let entity_id = json.get("entity_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
+                let action_str = json.get("action")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("Custom");
+                let action = match action_str {
+                    "Create" => AuditAction::Create,
+                    "Read" => AuditAction::Read,
+                    "Update" => AuditAction::Update,
+                    "Delete" => AuditAction::Delete,
+                    "Login" => AuditAction::Login,
+                    "Logout" => AuditAction::Logout,
+                    "Export" => AuditAction::Export,
+                    "Import" => AuditAction::Import,
+                    other => AuditAction::Custom(other.to_string()),
+                };
 
-        Ok(task.complete(result))
+                let user_id = json.get("user_id")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| Uuid::parse_str(s).ok());
+
+                let old_values = json.get("old_values").cloned();
+                let new_values = json.get("new_values").cloned();
+
+                // Perform validation checks
+                let mut warnings = Vec::new();
+
+                // Check for update without old/new values
+                if action == AuditAction::Update && old_values.is_none() && new_values.is_none() {
+                    warnings.push("Update action logged without old or new values".to_string());
+                }
+
+                // Check for delete without old values
+                if action == AuditAction::Delete && old_values.is_none() {
+                    warnings.push("Delete action logged without old values for reference".to_string());
+                }
+
+                // Log the audit entry with hash chaining
+                let audit_log = AuditLog {
+                    id: Uuid::new_v4(),
+                    user_id,
+                    action: action.clone(),
+                    entity_type: entity_type.to_string(),
+                    entity_id: entity_id.to_string(),
+                    old_values,
+                    new_values,
+                    timestamp: Utc::now(),
+                    ip_address: json.get("ip_address").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                    user_agent: json.get("user_agent").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                    success: true,
+                    error_message: None,
+                    prev_hash: None,
+                    chain_hash: None,
+                };
+
+                log_with_chain(&self.repository, audit_log).await?;
+
+                let mut result = TaskResult::success(&format!(
+                    "Audit check: {} {} on {}/{}",
+                    if warnings.is_empty() { "passed" } else { "warnings" },
+                    action_str,
+                    entity_type,
+                    entity_id,
+                ));
+                result.warnings = warnings;
+
+                let _processing_time = start_time.elapsed().as_millis() as f64;
+
+                Ok(task.complete(result))
+            }
+            _ => {
+                // System-level audit check
+                let audit_log = AuditLog {
+                    id: Uuid::new_v4(),
+                    user_id: None,
+                    action: AuditAction::Custom("System audit check".to_string()),
+                    entity_type: "system".to_string(),
+                    entity_id: "all".to_string(),
+                    old_values: None,
+                    new_values: None,
+                    timestamp: Utc::now(),
+                    ip_address: None,
+                    user_agent: None,
+                    success: true,
+                    error_message: None,
+                    prev_hash: None,
+                    chain_hash: None,
+                };
+
+                log_with_chain(&self.repository, audit_log).await?;
+
+                let result = TaskResult::success("System audit check completed");
+                let _processing_time = start_time.elapsed().as_millis() as f64;
+
+                Ok(task.complete(result))
+            }
+        }
     }
 
     /// Log a create action
@@ -154,6 +271,7 @@ impl AuditAgent {
             user_agent: None,
             success: true,
             error_message: None,
+            ..Default::default()
         };
         
         self.repository.log(audit_log).await?;
@@ -182,6 +300,7 @@ impl AuditAgent {
             user_agent: None,
             success: true,
             error_message: None,
+            ..Default::default()
         };
         
         self.repository.log(audit_log).await?;
@@ -209,6 +328,7 @@ impl AuditAgent {
             user_agent: None,
             success: true,
             error_message: None,
+            ..Default::default()
         };
         
         self.repository.log(audit_log).await?;
@@ -237,6 +357,7 @@ impl AuditAgent {
             user_agent: None,
             success: false,
             error_message: Some(error.to_string()),
+            ..Default::default()
         };
         
         self.repository.log(audit_log).await?;

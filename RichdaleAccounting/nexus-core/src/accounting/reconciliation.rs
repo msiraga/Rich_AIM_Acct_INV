@@ -76,6 +76,8 @@ pub struct StatementTransaction {
     pub is_matched: bool,
     /// Matched transaction ID
     pub matched_transaction_id: Option<Uuid>,
+    /// Match confidence score (0-210, higher is better)
+    pub match_score: Option<u32>,
 }
 
 /// Statement transaction type
@@ -96,6 +98,8 @@ pub struct ReconciliationProcessor {
     pub reconciliations_by_account: Arc<RwLock<HashMap<Uuid, Vec<Uuid>>>>,
     /// Optional SurrealDB connection for persistence
     pub db: Option<Arc<crate::database::Database>>,
+    /// Optional ledger for fetching book transactions to match against
+    pub ledger: Option<Arc<crate::accounting::ledger::Ledger>>,
 }
 
 impl Default for ReconciliationProcessor {
@@ -111,6 +115,7 @@ impl ReconciliationProcessor {
             reconciliations: Arc::new(RwLock::new(BTreeMap::new())),
             reconciliations_by_account: Arc::new(RwLock::new(HashMap::new())),
             db: None,
+            ledger: None,
         }
     }
 
@@ -319,7 +324,13 @@ impl ReconciliationProcessor {
         Ok(reconciliation)
     }
 
-    /// Match statement transactions with book transactions
+    /// Match statement transactions with book transactions.
+    ///
+    /// Uses a multi-pass fuzzy matching strategy:
+    /// 1. **Exact match**: amount + description + reference number
+    /// 2. **Strong match**: amount (within $0.01) + reference number
+    /// 3. **Amount match**: exact amount + date within 3 days
+    /// 4. **Fuzzy match**: amount within $0.01 + similar description
     fn match_transactions(
         &self,
         statement_transactions: &[StatementTransaction],
@@ -328,49 +339,100 @@ impl ReconciliationProcessor {
         let mut matched_statement = Vec::new();
         let mut unmatched_statement = Vec::new();
         let mut unmatched_book = Vec::new();
-        
-        // Create a map of book transactions by amount and description for matching
-        let mut book_map: HashMap<(Decimal, String), Vec<&Transaction>> = HashMap::new();
-        for txn in book_transactions {
-            let key = (txn.total_amount(), txn.description.clone());
-            book_map.entry(key).or_default().push(txn);
-        }
-        
-        // Try to match statement transactions with book transactions
+        let mut matched_book_ids: HashSet<Uuid> = HashSet::new();
+
+        // Amount tolerance for fuzzy matching
+        let tolerance = dec!(0.01);
+
         for statement_txn in statement_transactions {
-            let amount = match statement_txn.transaction_type {
+            let stmt_amount = match statement_txn.transaction_type {
                 StatementTransactionType::Debit => statement_txn.amount,
                 StatementTransactionType::Credit => -statement_txn.amount,
             };
-            
-            let key = (amount.abs(), statement_txn.description.clone());
-            
-            if let Some(book_txns) = book_map.get(&key) {
-                // Find the first unmatched book transaction
-                if let Some(book_txn) = book_txns.first() {
-                    let mut matched_txn = statement_txn.clone();
-                    matched_txn.is_matched = true;
-                    matched_txn.matched_transaction_id = Some(book_txn.id);
-                    matched_statement.push(matched_txn);
-                    continue;
+            let stmt_abs = stmt_amount.abs();
+
+            let mut best_match: Option<(&Transaction, u32)> = None; // (txn, score)
+
+            for book_txn in book_transactions {
+                if matched_book_ids.contains(&book_txn.id) {
+                    continue; // Already matched
+                }
+
+                let book_amount = book_txn.total_amount().abs();
+                let amount_diff = (stmt_abs - book_amount).abs();
+                let date_diff = (statement_txn.date - book_txn.date.date_naive()).num_days().unsigned_abs();
+
+                let mut score: u32 = 0;
+
+                // Amount matching
+                if amount_diff == dec!(0) {
+                    score += 100; // Exact amount match
+                } else if amount_diff <= tolerance {
+                    score += 80; // Within tolerance
+                } else {
+                    continue; // Amount too different, skip
+                }
+
+                // Description matching
+                if !statement_txn.description.is_empty() && !book_txn.description.is_empty() {
+                    let stmt_lower = statement_txn.description.to_lowercase();
+                    let book_lower = book_txn.description.to_lowercase();
+                    if stmt_lower == book_lower {
+                        score += 50; // Exact description
+                    } else if stmt_lower.contains(&book_lower) || book_lower.contains(&stmt_lower) {
+                        score += 30; // Partial description overlap
+                    } else if stmt_lower.split_whitespace().any(|w| book_lower.contains(w) && w.len() > 3) {
+                        score += 15; // Shared significant word
+                    }
+                }
+
+                // Reference number matching
+                if !statement_txn.reference.is_empty() {
+                    if book_txn.entries.iter().any(|e| e.reference.as_deref() == Some(&statement_txn.reference)) {
+                        score += 40; // Reference match on entry
+                    } else if book_txn.number == statement_txn.reference || book_txn.description.contains(&statement_txn.reference) {
+                        score += 30; // Reference in txn number or description
+                    }
+                }
+
+                // Date proximity
+                if date_diff == 0 {
+                    score += 20; // Same day
+                } else if date_diff <= 3 {
+                    score += 10; // Within 3 days
+                } else if date_diff <= 7 {
+                    score += 5; // Within a week
+                }
+
+                // Track the best match
+                if let Some((_, best_score)) = best_match {
+                    if score > best_score {
+                        best_match = Some((book_txn, score));
+                    }
+                } else {
+                    best_match = Some((book_txn, score));
                 }
             }
-            
-            // No match found
-            unmatched_statement.push(statement_txn.clone());
+
+            if let Some((matched_txn, score)) = best_match {
+                let mut matched = statement_txn.clone();
+                matched.is_matched = true;
+                matched.matched_transaction_id = Some(matched_txn.id);
+                matched.match_score = Some(score);
+                matched_statement.push(matched);
+                matched_book_ids.insert(matched_txn.id);
+            } else {
+                unmatched_statement.push(statement_txn.clone());
+            }
         }
-        
+
         // Find unmatched book transactions
-        let matched_book_ids: HashSet<Uuid> = matched_statement.iter()
-            .filter_map(|t| t.matched_transaction_id)
-            .collect();
-        
         for txn in book_transactions {
             if !matched_book_ids.contains(&txn.id) {
                 unmatched_book.push(txn.clone());
             }
         }
-        
+
         Ok((matched_statement, unmatched_statement, unmatched_book))
     }
 
@@ -460,8 +522,8 @@ pub struct ReconciliationAgent {
     pub config: AgentConfig,
     /// Current status
     pub status: AgentStatus,
-    /// Reconciliation processor
-    pub processor: ReconciliationProcessor,
+    /// Reconciliation processor (wrapped for interior mutability)
+    pub processor: Arc<Mutex<ReconciliationProcessor>>,
 }
 
 impl ReconciliationAgent {
@@ -470,7 +532,7 @@ impl ReconciliationAgent {
         Self {
             config,
             status: AgentStatus::Idle,
-            processor,
+            processor: Arc::new(Mutex::new(processor)),
         }
     }
 
@@ -494,14 +556,13 @@ impl Agent for ReconciliationAgent {
 
     async fn initialize(&mut self) -> Result<(), anyhow::Error> {
         self.status = AgentStatus::Initializing;
-        self.processor.initialize().await?;
+        self.processor.lock().await.initialize().await?;
         self.status = AgentStatus::Idle;
         Ok(())
     }
 
     async fn shutdown(&mut self) -> Result<(), anyhow::Error> {
         self.status = AgentStatus::ShuttingDown;
-        // Clean up resources
         self.status = AgentStatus::Idle;
         Ok(())
     }
@@ -529,47 +590,134 @@ impl Agent for ReconciliationAgent {
 }
 
 impl ReconciliationAgent {
-    /// Process a reconcile account task
+    /// Process a reconcile account task.
+    ///
+    /// Accepts either:
+    /// - `TaskPayload::Account` — creates a basic reconciliation from the account balance
+    /// - `TaskPayload::Json` with fields:
+    ///     `account_id` (string, UUID), `starting_balance` (string/number),
+    ///     `statement_ending_balance` (string/number), `statement_date` (YYYY-MM-DD),
+    ///     `statement_transactions` (array of {date, description, amount, transaction_type: "Debit"|"Credit", reference})
     async fn process_reconcile_account(&self, task: Task) -> Result<Task, anyhow::Error> {
-        // Status tracking deferred - requires interior mutability
-
         let start_time = std::time::Instant::now();
+        let mut processor = self.processor.lock().await;
 
-        // Extract account from task payload
-        let account = match &task.payload {
-            TaskPayload::Account(acc) => acc.clone(),
+        let reconciliation = match &task.payload {
+            TaskPayload::Account(acc) => {
+                // Simple reconciliation from account balance
+                processor.create_reconciliation(
+                    acc.id,
+                    Utc::now().date_naive(),
+                    acc.balance,
+                    acc.balance,
+                ).await.map_err(|e| AgentError::TaskProcessingFailed(e.to_string()))?
+            }
+            TaskPayload::Json(json) => {
+                let account_id_str = json.get("account_id")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| AgentError::TaskProcessingFailed("Missing account_id".to_string()))?;
+                let account_id = Uuid::parse_str(account_id_str)
+                    .map_err(|e| AgentError::TaskProcessingFailed(format!("Invalid account_id: {}", e)))?;
+
+                let starting_balance = json.get("starting_balance")
+                    .and_then(|v| v.as_str().or_else(|| v.as_f64().map(|_| "")).or(Some("")))
+                    .and_then(|_| {
+                        if let Some(s) = json.get("starting_balance").and_then(|v| v.as_str()) {
+                            s.parse::<Decimal>().ok()
+                        } else if let Some(n) = json.get("starting_balance").and_then(|v| v.as_f64()) {
+                            Decimal::from_f64_retain(n)
+                        } else {
+                            Some(dec!(0))
+                        }
+                    })
+                    .unwrap_or(dec!(0));
+
+                let statement_ending_balance = json.get("statement_ending_balance")
+                    .and_then(|v| {
+                        if let Some(s) = v.as_str() {
+                            s.parse::<Decimal>().ok()
+                        } else if let Some(n) = v.as_f64() {
+                            Decimal::from_f64_retain(n)
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or(dec!(0));
+
+                let statement_date = json.get("statement_date")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| NaiveDate::parse_from_str(s, "%Y-%m-%d").ok())
+                    .unwrap_or_else(|| Utc::now().date_naive());
+
+                // Parse statement transactions if provided
+                let statement_transactions: Vec<StatementTransaction> = json.get("statement_transactions")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter().filter_map(|item| {
+                            let date = item.get("date").and_then(|v| v.as_str())
+                                .and_then(|s| NaiveDate::parse_from_str(s, "%Y-%m-%d").ok())
+                                .unwrap_or_else(|| Utc::now().date_naive());
+                            let description = item.get("description").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                            let amount = item.get("amount").and_then(|v| {
+                                if let Some(s) = v.as_str() { s.parse::<Decimal>().ok() }
+                                else if let Some(n) = v.as_f64() { Decimal::from_f64_retain(n) }
+                                else { None }
+                            }).unwrap_or(dec!(0));
+                            let txn_type = item.get("transaction_type").and_then(|v| v.as_str())
+                                .map(|s| match s {
+                                    "Debit" | "debit" => StatementTransactionType::Debit,
+                                    _ => StatementTransactionType::Credit,
+                                })
+                                .unwrap_or(StatementTransactionType::Credit);
+                            let reference = item.get("reference").and_then(|v| v.as_str()).unwrap_or("").to_string();
+
+                            Some(StatementTransaction {
+                                date,
+                                description,
+                                amount,
+                                transaction_type: txn_type,
+                                reference,
+                                is_matched: false,
+                                matched_transaction_id: None,
+                                match_score: None,
+                            })
+                        }).collect()
+                    })
+                    .unwrap_or_default();
+
+                // Fetch book transactions from the shared ledger for matching
+                let book_transactions = match &processor.ledger {
+                    Some(ledger) => ledger.list_transactions()
+                        .await
+                        .map_err(|e| AgentError::TaskProcessingFailed(e.to_string()))?,
+                    None => Vec::new(),
+                };
+
+                processor.reconcile_account(
+                    account_id,
+                    statement_date,
+                    starting_balance,
+                    statement_ending_balance,
+                    statement_transactions,
+                    book_transactions,
+                ).await.map_err(|e| AgentError::TaskProcessingFailed(e.to_string()))?
+            }
             _ => return Err(AgentError::TaskProcessingFailed(
-                "Expected Account payload for ReconcileAccount task".to_string()
+                "Expected Account or Json payload for ReconcileAccount task".to_string()
             ).into()),
         };
 
-        // In a real implementation, we would fetch statement data and transactions
-        // For now, we'll create a mock reconciliation
-        let reconciliation = Reconciliation {
-            id: Uuid::new_v4(),
-            account_id: account.id,
-            statement_date: Utc::now().date_naive(),
-            starting_balance: account.balance,
-            ending_balance: account.balance,
-            statement_ending_balance: account.balance,
-            reconciled_transactions: Vec::new(),
-            outstanding_transactions: Vec::new(),
-            difference: dec!(0),
-            status: ReconciliationStatus::Completed,
-            notes: "Mock reconciliation".to_string(),
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-        };
-
-        // Create success result
-        let result = TaskResult::success_with_data(
-            "Account reconciled successfully",
-            TaskPayload::Json(serde_json::to_value(reconciliation).unwrap())
+        let message = format!(
+            "Account reconciled: difference={}, status={:?}",
+            reconciliation.difference, reconciliation.status
         );
 
-        let processing_time = start_time.elapsed().as_millis() as f64;
+        let result = TaskResult::success_with_data(
+            &message,
+            TaskPayload::Json(serde_json::to_value(&reconciliation).unwrap_or_default()),
+        );
 
-        // Status tracking deferred - requires interior mutability
+        let _processing_time = start_time.elapsed().as_millis() as f64;
 
         Ok(task.complete(result))
     }
@@ -653,6 +801,7 @@ mod tests {
                 reference: "REF001".to_string(),
                 is_matched: false,
                 matched_transaction_id: None,
+                match_score: None,
             },
             StatementTransaction {
                 date: Utc::now().date_naive(),
@@ -662,6 +811,7 @@ mod tests {
                 reference: "REF002".to_string(),
                 is_matched: false,
                 matched_transaction_id: None,
+                match_score: None,
             },
         ];
         

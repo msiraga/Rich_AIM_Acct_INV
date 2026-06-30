@@ -7,11 +7,69 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 use chrono::{DateTime, Utc};
+use tracing::warn;
 use crate::agents::agent_types::{Agent, AgentConfig, AgentType, AgentStatus};
 use crate::agents::task::{Task, TaskResult, TaskPayload};
 use crate::agents::error::AgentError;
 use crate::database::models::Document;
 use crate::database::BoundingBox;
+
+/// Simple base64 encoding (standard alphabet, padded)
+fn base64_encode(data: &[u8]) -> String {
+    const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut result = String::with_capacity((data.len() + 2) / 3 * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
+        let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        result.push(CHARS[((n >> 18) & 0x3F) as usize] as char);
+        result.push(CHARS[((n >> 12) & 0x3F) as usize] as char);
+        if chunk.len() > 1 {
+            result.push(CHARS[((n >> 6) & 0x3F) as usize] as char);
+        } else {
+            result.push('=');
+        }
+        if chunk.len() > 2 {
+            result.push(CHARS[(n & 0x3F) as usize] as char);
+        } else {
+            result.push('=');
+        }
+    }
+    result
+}
+
+/// Simple base64 decoding (standard alphabet, padded)
+fn base64_decode(input: &str) -> Vec<u8> {
+    fn decode_char(c: u8) -> u8 {
+        match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => 0,
+        }
+    }
+    let mut result = Vec::with_capacity(input.len() * 3 / 4);
+    let chars: Vec<u8> = input.bytes().filter(|&b| b != b'\n' && b != b'\r').collect();
+    for chunk in chars.chunks(4) {
+        if chunk.len() < 2 { break; }
+        let a = decode_char(chunk[0]) as u32;
+        let b = decode_char(chunk[1]) as u32;
+        let cv = if chunk.len() > 2 { decode_char(chunk[2]) as u32 } else { 0 };
+        let dv = if chunk.len() > 3 { decode_char(chunk[3]) as u32 } else { 0 };
+        let n = (a << 18) | (b << 12) | (cv << 6) | dv;
+        result.push(((n >> 16) & 0xFF) as u8);
+        if chunk.len() > 2 && chunk[2] != b'=' {
+            result.push(((n >> 8) & 0xFF) as u8);
+        }
+        if chunk.len() > 3 && chunk[3] != b'=' {
+            result.push((n & 0xFF) as u8);
+        }
+    }
+    result
+}
 
 /// Document Agent for handling document-related tasks
 #[derive(Debug, Clone)]
@@ -164,27 +222,101 @@ impl DocumentAgent {
         Ok(task.complete(result))
     }
 
-    /// Store a document in the database
+    /// Store a document in SurrealDB
     async fn store_document(&self, document: Document) -> Result<Document, anyhow::Error> {
-        // In a real implementation, this would store the document in SurrealDB
-        // For now, we'll just return the document with an updated timestamp
-        
         let mut stored_document = document;
-        stored_document.created_at = Utc::now();
         stored_document.updated_at = Utc::now();
-        
+        if stored_document.created_at == DateTime::<Utc>::default()
+            || stored_document.created_at.timestamp() == 0
+        {
+            stored_document.created_at = Utc::now();
+        }
+
+        // Classify document type from name
+        let classified_type = self.classify_document(&stored_document).await?;
+        stored_document.document_type = classified_type;
+
+        // Persist to SurrealDB if connected
+        let db_guard = self.db.lock().await;
+        if let Some(ref client) = *db_guard {
+            let doc_type_str = stored_document.document_type.to_str().to_string();
+            let bbox_json = serde_json::to_value(&stored_document.bounding_box).unwrap_or_default();
+            let metadata_json = stored_document.metadata.clone();
+            // Store binary content as base64 for SurrealDB
+            let content_b64 = base64_encode(&stored_document.content);
+
+            if let Err(e) = client.query(
+                "CREATE document SET \
+                 id = $id, name = $name, document_type = $document_type, \
+                 content_b64 = $content_b64, metadata = $metadata, \
+                 bounding_box = $bounding_box, \
+                 created_at = $created_at, updated_at = $updated_at"
+            )
+            .bind(("id", stored_document.id.clone()))
+            .bind(("name", stored_document.name.clone()))
+            .bind(("document_type", doc_type_str))
+            .bind(("content_b64", content_b64))
+            .bind(("metadata", metadata_json.to_string()))
+            .bind(("bounding_box", bbox_json.to_string()))
+            .bind(("created_at", stored_document.created_at.to_rfc3339()))
+            .bind(("updated_at", stored_document.updated_at.to_rfc3339()))
+            .await
+            {
+                warn!("Failed to persist document {} to SurrealDB: {}", stored_document.id, e);
+            }
+        }
+
         Ok(stored_document)
     }
 
-    /// Retrieve a document from the database
+    /// Retrieve a document from SurrealDB
     async fn retrieve_document(&self, document_id: &str) -> Result<Document, anyhow::Error> {
-        // In a real implementation, this would retrieve the document from SurrealDB
-        // For now, we'll return a mock document
-        
         if document_id.is_empty() {
             return Err(AgentError::TaskProcessingFailed("Document ID cannot be empty".to_string()).into());
         }
-        
+
+        // Try SurrealDB first
+        let db_guard = self.db.lock().await;
+        if let Some(ref client) = *db_guard {
+            let mut result = client.query(
+                "SELECT * FROM document WHERE id = $id LIMIT 1"
+            )
+            .bind(("id", document_id.to_string()))
+            .await;
+
+            if let Ok(mut response) = result {
+                if let Ok(Some(doc_value)) = response.take::<Option<serde_json::Value>>(0) {
+                    let name = doc_value.get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(document_id)
+                        .to_string();
+                    let doc_type_str = doc_value.get("document_type")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("other");
+                    let content_b64 = doc_value.get("content_b64")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let content = base64_decode(content_b64);
+                    let metadata: serde_json::Value = doc_value.get("metadata")
+                        .cloned()
+                        .unwrap_or(serde_json::json!({}));
+
+                    return Ok(Document {
+                        id: document_id.to_string(),
+                        name,
+                        document_type: crate::database::models::DocumentType::from_str(doc_type_str),
+                        content,
+                        metadata,
+                        created_at: Utc::now(),
+                        updated_at: Utc::now(),
+                        bounding_box: None,
+                    });
+                }
+            }
+        }
+
+        // Fallback: return a stub if SurrealDB unavailable
+        warn!("Document {} not found in SurrealDB, returning stub", document_id);
         Ok(Document {
             id: document_id.to_string(),
             name: format!("Document {}", document_id),
@@ -193,7 +325,7 @@ impl DocumentAgent {
             metadata: serde_json::json!({}),
             created_at: Utc::now(),
             updated_at: Utc::now(),
-            bounding_box: Some(crate::database::BoundingBox::default()),
+            bounding_box: None,
         })
     }
 

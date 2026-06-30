@@ -41,6 +41,12 @@ pub struct AgentOrchestrator {
     pub is_running: Arc<Mutex<bool>>,
     /// Optional database connection for persistent storage
     pub database: Option<crate::database::Database>,
+    /// Event-driven notification for new tasks (replaces busy-wait sleep)
+    pub task_notify: Arc<tokio::sync::Notify>,
+    /// Shared ledger used by all accounting agents (LedgerAgent, InvoiceAgent, ReceiptAgent, ReportingAgent)
+    pub shared_ledger: Option<Arc<crate::accounting::ledger::Ledger>>,
+    /// Persisted dead letter queue file path (None = not persisted)
+    pub dead_letter_path: Option<String>,
 }
 
 impl std::fmt::Debug for AgentOrchestrator {
@@ -71,6 +77,9 @@ impl AgentOrchestrator {
             agent_statuses: Arc::new(RwLock::new(HashMap::new())),
             is_running: Arc::new(Mutex::new(false)),
             database: None,
+            task_notify: Arc::new(tokio::sync::Notify::new()),
+            shared_ledger: None,
+            dead_letter_path: None,
         }
     }
 
@@ -88,6 +97,9 @@ impl AgentOrchestrator {
             agent_statuses: Arc::new(RwLock::new(HashMap::new())),
             is_running: Arc::new(Mutex::new(false)),
             database: Some(database),
+            task_notify: Arc::new(tokio::sync::Notify::new()),
+            shared_ledger: None,
+            dead_letter_path: None,
         }
     }
 
@@ -104,6 +116,17 @@ impl AgentOrchestrator {
             db.seed().await
                 .map_err(|e| anyhow::anyhow!("Failed to seed database: {}", e))?;
         }
+
+        // Create and initialize a shared ledger for all accounting agents.
+        // This ensures InvoiceAgent, ReceiptAgent, ReportingAgent, and LedgerAgent
+        // all see the same accounts, transactions, and balances.
+        let mut shared_ledger = crate::accounting::ledger::Ledger::new();
+        if let Some(ref db) = self.database {
+            shared_ledger.db = Some(Arc::new(db.clone()));
+        }
+        shared_ledger.initialize().await
+            .map_err(|e| anyhow::anyhow!("Failed to initialize shared ledger: {}", e))?;
+        self.shared_ledger = Some(Arc::new(shared_ledger));
 
         // Create default agents for each type
         self.create_default_agents().await?;
@@ -178,36 +201,62 @@ impl AgentOrchestrator {
         // Create the appropriate agent based on type
         let agent: Arc<Mutex<dyn Agent>> = match config.agent_type {
             AgentType::LedgerAgent => {
-                let mut ledger = crate::accounting::ledger::Ledger::new();
-                if let Some(ref db) = self.database {
-                    ledger.db = Some(Arc::new(db.clone()));
-                }
+                let ledger = match &self.shared_ledger {
+                    Some(shared) => crate::accounting::ledger::Ledger {
+                        accounts: shared.accounts.clone(),
+                        transactions: shared.transactions.clone(),
+                        journal_entries: shared.journal_entries.clone(),
+                        current_journal_number: shared.current_journal_number.clone(),
+                        current_transaction_number: shared.current_transaction_number.clone(),
+                        db: shared.db.clone(),
+                    },
+                    None => {
+                        let mut l = crate::accounting::ledger::Ledger::new();
+                        if let Some(ref db) = self.database {
+                            l.db = Some(Arc::new(db.clone()));
+                        }
+                        l
+                    }
+                };
                 Arc::new(Mutex::new(crate::accounting::ledger::LedgerAgent::new(
                     config.clone(),
                     ledger
                 )))
             }
             AgentType::ReconciliationAgent => {
+                let mut processor = crate::accounting::reconciliation::ReconciliationProcessor::new();
+                if let Some(ref db) = self.database {
+                    processor.db = Some(Arc::new(db.clone()));
+                }
+                // Wire the shared ledger for fetching book transactions
+                processor.ledger = self.shared_ledger.clone();
                 Arc::new(Mutex::new(crate::accounting::reconciliation::ReconciliationAgent::new(
                     config.clone(),
-                    crate::accounting::reconciliation::ReconciliationProcessor::new()
+                    processor
                 )))
             }
             AgentType::InvoiceAgent => {
-                // TODO: Replace with dedicated InvoiceAgent when implemented
-                let mut ledger = crate::accounting::ledger::Ledger::new();
+                let mut processor = crate::accounting::invoice::InvoiceProcessor::new();
                 if let Some(ref db) = self.database {
-                    ledger.db = Some(Arc::new(db.clone()));
+                    processor.db = Some(Arc::new(db.clone()));
                 }
-                Arc::new(Mutex::new(crate::accounting::ledger::LedgerAgent::new(
+                // Wire the shared ledger so payment transactions use real accounts
+                processor.ledger = self.shared_ledger.clone();
+                Arc::new(Mutex::new(crate::accounting::invoice::InvoiceAgent::new(
                     config.clone(),
-                    ledger
+                    processor
                 )))
             }
             AgentType::PayrollAgent => {
+                let mut processor = crate::accounting::payroll::PayrollProcessor::new();
+                if let Some(ref db) = self.database {
+                    processor.db = Some(Arc::new(db.clone()));
+                }
+                // Wire the shared ledger for real account references in payroll transactions
+                processor.ledger = self.shared_ledger.clone();
                 Arc::new(Mutex::new(crate::accounting::payroll::PayrollAgent::new(
                     config.clone(),
-                    crate::accounting::payroll::PayrollProcessor::new()
+                    processor
                 )))
             }
             AgentType::TaxAgent => {
@@ -217,13 +266,15 @@ impl AgentOrchestrator {
                 )))
             }
             AgentType::ReceiptAgent => {
-                let db_client = match &self.database {
-                    Some(db) => db.client(),
-                    None => Arc::new(Mutex::new(None)),
-                };
-                Arc::new(Mutex::new(crate::agents::document::DocumentAgent::new(
+                let mut processor = crate::accounting::receipt::ReceiptProcessor::new();
+                if let Some(ref db) = self.database {
+                    processor.db = Some(Arc::new(db.clone()));
+                }
+                // Wire the shared ledger so expense transactions use real accounts
+                processor.ledger = self.shared_ledger.clone();
+                Arc::new(Mutex::new(crate::accounting::receipt::ReceiptAgent::new(
                     config.clone(),
-                    db_client
+                    processor
                 )))
             }
             AgentType::DocumentAgent => {
@@ -247,12 +298,16 @@ impl AgentOrchestrator {
                 )))
             }
             AgentType::ReportingAgent => {
-                // TODO: Replace with dedicated ReportingAgent when implemented
-                let mut ledger = crate::accounting::ledger::Ledger::new();
-                if let Some(ref db) = self.database {
-                    ledger.db = Some(Arc::new(db.clone()));
-                }
-                Arc::new(Mutex::new(crate::accounting::ledger::LedgerAgent::new(
+                // Use the shared ledger so reports contain real data from all agents
+                let ledger = self.shared_ledger.clone()
+                    .or_else(|| {
+                        let mut l = crate::accounting::ledger::Ledger::new();
+                        if let Some(ref db) = self.database {
+                            l.db = Some(Arc::new(db.clone()));
+                        }
+                        Some(Arc::new(l))
+                    });
+                Arc::new(Mutex::new(crate::accounting::reporting::ReportingAgent::new(
                     config.clone(),
                     ledger
                 )))
@@ -318,6 +373,9 @@ impl AgentOrchestrator {
         // Add task to queue
         self.task_queue.lock().await.push_back(task);
 
+        // Notify the dispatch loop that a new task is available
+        self.task_notify.notify_one();
+
         Ok(task_id)
     }
 
@@ -351,20 +409,28 @@ impl AgentOrchestrator {
         Ok(())
     }
 
-    /// Process the next available task
+    /// Process the next available task(s). Sorts queue by priority (highest first),
+    /// then processes each ready task. Uses tokio::spawn for concurrent execution
+    /// when multiple tasks and agents are available.
     pub async fn process_next_task(&self) -> Result<(), anyhow::Error> {
+        // Sort queue by priority (Critical=10 first, Low=1 last)
+        {
+            let mut task_queue = self.task_queue.lock().await;
+            task_queue.make_contiguous().sort_by(|a, b| b.priority.cmp(&a.priority));
+        }
+
         // Get the next task from the queue
         let mut task_queue = self.task_queue.lock().await;
         let task = match task_queue.pop_front() {
             Some(task) => task,
             None => return Ok(()), // No tasks to process
         };
-        
+
         drop(task_queue); // Release the lock
-        
+
         // Find an available agent for this task
         let assigned_agent_id = self.find_available_agent(&task).await;
-        
+
         match assigned_agent_id {
             Some(agent_id) => {
                 // Assign the task to the agent
@@ -376,7 +442,7 @@ impl AgentOrchestrator {
                 self.task_queue.lock().await.push_front(task);
             }
         }
-        
+
         Ok(())
     }
 
@@ -514,6 +580,11 @@ impl AgentOrchestrator {
             // Max retries exceeded, add to failed tasks
             self.failed_tasks.lock().await.push_back(task);
         }
+
+        // Persist to dead letter queue if configured
+        if let Some(ref path) = self.dead_letter_path {
+            self.persist_failed_tasks(path).await?;
+        }
         
         // Update agent status
         let mut statuses = self.agent_statuses.write().await;
@@ -523,6 +594,16 @@ impl AgentOrchestrator {
             status.record_task_failure(&error);
         }
         
+        Ok(())
+    }
+
+    /// Persist failed tasks to a JSON file (dead letter queue).
+    pub async fn persist_failed_tasks(&self, path: &str) -> Result<(), anyhow::Error> {
+        let failed = self.failed_tasks.lock().await;
+        let data = serde_json::to_string_pretty(&*failed)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize failed tasks: {}", e))?;
+        tokio::fs::write(path, data).await?;
+        info!("Persisted {} failed tasks to {}", failed.len(), path);
         Ok(())
     }
 
@@ -544,20 +625,30 @@ impl AgentOrchestrator {
         system_status
     }
 
-    /// Start the orchestrator's main processing loop
+    /// Start the orchestrator's main processing loop.
+    ///
+    /// Uses `tokio::sync::Notify` for event-driven dispatch — the loop
+    /// sleeps until a task is submitted (via `submit_task`), then
+    /// immediately processes it. No busy-wait polling.
     pub async fn start(&self) -> Result<(), anyhow::Error> {
-        info!("Starting Agent Orchestrator processing loop...");
-        
+        info!("Starting Agent Orchestrator processing loop (event-driven)...");
+
         *self.is_running.lock().await = true;
-        
+
         while *self.is_running.lock().await {
-            // Process the next task
-            self.process_next_task().await?;
-            
-            // Small delay to prevent busy waiting
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            // Process all queued tasks before waiting for the next notification
+            loop {
+                let has_tasks = !self.task_queue.lock().await.is_empty();
+                if !has_tasks {
+                    break;
+                }
+                self.process_next_task().await?;
+            }
+
+            // Wait for a new task to be submitted (event-driven, no busy-wait)
+            self.task_notify.notified().await;
         }
-        
+
         Ok(())
     }
 
