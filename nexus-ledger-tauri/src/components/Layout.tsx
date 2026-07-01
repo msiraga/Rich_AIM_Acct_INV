@@ -13,6 +13,7 @@ function Layout() {
     { path: "/accounts", label: "Accounts" },
     { path: "/transactions", label: "Transactions" },
     { path: "/invoices", label: "Invoices" },
+    { path: "/documents", label: "Documents" },
     ...(canWrite ? [{ path: "/journal", label: "New Entry" }] : []),
   ];
 

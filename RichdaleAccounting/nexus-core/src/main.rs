@@ -5,6 +5,7 @@
 use nexus_core::{NexusLedger, api::{ApiServer, ApiConfig}};
 use nexus_core::database::Database;
 use nexus_core::database::user::SurrealUserRepository;
+use nexus_core::edge::{EdgeManager, EdgeConfig};
 use tracing::{info, Level};
 use tracing_subscriber::{FmtSubscriber, EnvFilter};
 use std::sync::Arc;
@@ -55,7 +56,15 @@ async fn main() -> Result<(), anyhow::Error> {
 
     // Start the API server with axum
     let api_config = ApiConfig::from_env();
-    let api_server = ApiServer::new(api_config, orchestrator, db, nexus, user_repo);
+    let api_server = ApiServer::new(api_config, orchestrator, db.clone(), nexus.clone(), user_repo);
+
+    // Initialize edge manager for offline-first operation
+    let edge_config = EdgeConfig::from_env();
+    let mut edge_manager = EdgeManager::new(edge_config, db, nexus);
+    if let Err(e) = edge_manager.initialize().await {
+        info!("Edge manager initialization skipped (non-fatal): {}", e);
+    }
+    let api_server = api_server.with_edge_manager(Arc::new(Mutex::new(edge_manager)));
 
     info!("Starting API server on {}:{}...", api_server.config.host, api_server.config.port);
     info!("WebSocket chat: ws://{}:{}/ws/chat", api_server.config.host, api_server.config.port);

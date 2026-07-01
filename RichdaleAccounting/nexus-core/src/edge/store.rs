@@ -1527,11 +1527,11 @@ mod tests {
     fn test_decimal_precision_large_value() {
         let store = make_store();
         let mut account = make_account();
-        account.balance = dec!("9999999999.999999");
+        account.balance = Decimal::from_str("9999999999.999999").unwrap();
 
         store.save_account(&account).expect("save");
         let retrieved = store.get_account(account.id).expect("get");
-        assert_eq!(retrieved.balance, dec!("9999999999.999999"));
+        assert_eq!(retrieved.balance, Decimal::from_str("9999999999.999999").unwrap());
     }
 
     #[test]
@@ -1539,11 +1539,11 @@ mod tests {
         let store = make_store();
         let mut account = make_account();
         account.number = "1001".to_string();
-        account.balance = dec!("0.00000001");
+        account.balance = Decimal::from_str("0.00000001").unwrap();
 
         store.save_account(&account).expect("save");
         let retrieved = store.get_account(account.id).expect("get");
-        assert_eq!(retrieved.balance, dec!("0.00000001"));
+        assert_eq!(retrieved.balance, Decimal::from_str("0.00000001").unwrap());
     }
 
     #[test]
@@ -1551,11 +1551,11 @@ mod tests {
         let store = make_store();
         let mut account = make_account();
         account.number = "1002".to_string();
-        account.balance = dec!("123456789.123456789012345678");
+        account.balance = Decimal::from_str("123456789.123456789012345678").unwrap();
 
         store.save_account(&account).expect("save");
         let retrieved = store.get_account(account.id).expect("get");
-        assert_eq!(retrieved.balance, dec!("123456789.123456789012345678"));
+        assert_eq!(retrieved.balance, Decimal::from_str("123456789.123456789012345678").unwrap());
     }
 
     // ── Multi-Currency Tests ──────────────────────────────
@@ -1654,12 +1654,12 @@ mod tests {
             .expect("query changes");
 
         assert_eq!(changes.len(), 1);
-        assert_eq!(changes[0].get::<String, _>("entity_type").unwrap(), "account");
+        assert_eq!(changes[0].get::<String>("entity_type").unwrap(), "account");
         assert_eq!(
-            changes[0].get::<String, _>("entity_id").unwrap(),
+            changes[0].get::<String>("entity_id").unwrap(),
             account.id.to_string()
         );
-        assert_eq!(changes[0].get::<String, _>("operation").unwrap(), "insert");
+        assert_eq!(changes[0].get::<String>("operation").unwrap(), "insert");
     }
 
     #[test]
@@ -1680,8 +1680,8 @@ mod tests {
             .expect("query changes");
 
         assert_eq!(changes.len(), 2);
-        assert_eq!(changes[0].get::<String, _>("operation").unwrap(), "insert");
-        assert_eq!(changes[1].get::<String, _>("operation").unwrap(), "delete");
+        assert_eq!(changes[0].get::<String>("operation").unwrap(), "insert");
+        assert_eq!(changes[1].get::<String>("operation").unwrap(), "delete");
     }
 
     #[test]
@@ -1704,8 +1704,8 @@ mod tests {
             .expect("query changes");
 
         assert_eq!(changes.len(), 2);
-        assert_eq!(changes[0].get::<String, _>("operation").unwrap(), "insert");
-        assert_eq!(changes[1].get::<String, _>("operation").unwrap(), "update");
+        assert_eq!(changes[0].get::<String>("operation").unwrap(), "insert");
+        assert_eq!(changes[1].get::<String>("operation").unwrap(), "update");
     }
 
     // ── Enum Round-Trip Tests ─────────────────────────────

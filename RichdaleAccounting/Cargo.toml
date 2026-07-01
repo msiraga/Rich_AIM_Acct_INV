@@ -39,3 +39,12 @@ jsonwebtoken = "9"
 governor = "0.6"
 prometheus = "0.13"
 criterion = { version = "0.5", features = ["async_tokio"] }
+rusqlite = { version = "0.31", features = ["bundled"] }
+aes-gcm = "0.10"
+hkdf = "0.12"
+lz4 = "1.24"
+rand = "0.8"
+pdf-extract = "0.8"
+llama_cpp_rs = "0.3"
+zeroize = { version = "1.7", features = ["derive"] }
+crc32fast = "1.3"

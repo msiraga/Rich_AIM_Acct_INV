@@ -1,434 +1,709 @@
 /**
  * SyncStatus — fixed-position edge-sync indicator for NexusLedger.
  *
- * Polls `GET /api/v1/edge/status` every 5 seconds and renders a compact
- * pill in the bottom-right corner.  Four visual states:
+ * Renders four visual states driven by `GET /api/v1/edge/status`:
  *
- *   1. online   — green dot, "Up to date", last-sync time
- *   2. syncing  — yellow spinner, "Syncing..."
- *   3. offline  — orange dot, "Offline — N changes pending"
- *   4. error    — red dot, "Sync error" + "Retry Sync" button
+ *   1. Up to date  — green dot, "Last synced: X min ago"
+ *   2. Syncing...  — yellow spinner + progress bar ("Pushing 47/100, Pulling 12")
+ *   3. Offline     — orange dot, "Offline — N changes pending", offline duration
+ *   4. Sync error  — red dot, expandable error details, "Retry" button
  *
- * On hover the pill expands to reveal last-sync time, storage usage,
- * pending-change count, and (when applicable) a "Sync Now" button.
- * If the status endpoint itself is unreachable, a red
- * "Connection error" indicator is shown instead.
+ * Polling cadence adapts: 5 s while online, 30 s while offline.
+ * Manual sync button calls `POST /api/v1/edge/sync` with a 3 s debounce.
+ *
+ * The component is safe to mount globally: it renders `null` when the
+ * current user is not authenticated, so it never fires API calls before
+ * login.
  */
 
-import { useState, useEffect, useCallback, useRef } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { apiGet, apiPost } from "../lib/api";
+import { useAuth } from "../contexts/AuthContext";
 
-/* ── Types ─────────────────────────────────────────────────────────── */
+/* ------------------------------------------------------------------ */
+/*  Types                                                              */
+/* ------------------------------------------------------------------ */
 
-interface EdgeSyncStatus {
+interface SyncProgress {
+  pushed: number;
+  push_total: number;
+  pulled: number;
+  pull_total: number;
+}
+
+interface EdgeStatus {
   enabled: boolean;
   offline_mode: boolean;
   is_online: boolean;
-  last_sync: string | null;
+  last_sync: string | null; // ISO timestamp
   sync_in_progress: boolean;
   pending_changes: number;
-  storage_used_mb: number;
-  storage_max_mb: number;
+  conflicts: number;
+  sync_progress?: SyncProgress;
+  error?: string | null;
 }
 
-interface ApiResponse<T> {
-  success: boolean;
-  data: T;
-  error?: string;
-}
+/* ------------------------------------------------------------------ */
+/*  Styling constants                                                  */
+/* ------------------------------------------------------------------ */
 
-interface SyncResult {
-  synced: number;
-  errors: number;
-}
-
-type SyncState = "online" | "syncing" | "offline" | "error";
-
-/* ── Constants ─────────────────────────────────────────────────────── */
-
-const POLL_INTERVAL_MS = 5000;
-
-/**
- * Inline style fallbacks for dot colours.  The corresponding CSS classes
- * (`.sync-dot-green` etc.) will be defined centrally in index.css; these
- * inline values guarantee the indicator is visible even before that CSS
- * is wired in.  CSS classes can override by using `!important` if a
- * different palette is desired.
- */
-const DOT_COLORS: Record<string, string> = {
-  "sync-dot-green": "#4ade80",
-  "sync-dot-yellow": "#fbbf24",
-  "sync-dot-orange": "#f97316",
-  "sync-dot-red": "#f87171",
+const COLORS = {
+  bg: "#16213e",
+  border: "#2a2a4a",
+  text: "#e0e0e0",
+  textMuted: "#8888aa",
+  green: "#4caf50",
+  yellow: "#ffc107",
+  orange: "#ff9800",
+  red: "#f44336",
+  amber: "#ffb300",
+  btnBg: "#1e2d4a",
+  btnHover: "#2a3d5e",
+  progressBarBg: "#0d1730",
+  expandBg: "#0f1a30",
 };
 
-/* ── Helpers ───────────────────────────────────────────────────────── */
+const CONTAINER_STYLE: React.CSSProperties = {
+  position: "fixed",
+  bottom: "16px",
+  right: "16px",
+  width: "280px",
+  zIndex: 1000,
+  background: COLORS.bg,
+  border: `1px solid ${COLORS.border}`,
+  borderRadius: "8px",
+  padding: "12px 14px",
+  color: COLORS.text,
+  fontFamily: "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif",
+  fontSize: "13px",
+  boxShadow: "0 4px 16px rgba(0,0,0,0.4)",
+};
 
-/** Compact relative-time string for the pill (e.g. "5m ago", "Jul 1"). */
-function formatLastSyncShort(iso: string | null): string {
-  if (!iso) return "";
-  const date = new Date(iso);
-  if (isNaN(date.getTime())) return "";
+const HEADER_ROW_STYLE: React.CSSProperties = {
+  display: "flex",
+  alignItems: "center",
+  gap: "8px",
+  marginBottom: "4px",
+};
 
-  const diffMs = Date.now() - date.getTime();
+const DOT_STYLE: React.CSSProperties = {
+  width: "8px",
+  height: "8px",
+  borderRadius: "50%",
+  flexShrink: 0,
+};
+
+const MUTED_TEXT_STYLE: React.CSSProperties = {
+  color: COLORS.textMuted,
+  fontSize: "11px",
+};
+
+const SYNC_BTN_STYLE: React.CSSProperties = {
+  marginTop: "8px",
+  width: "100%",
+  padding: "6px 10px",
+  background: COLORS.btnBg,
+  border: `1px solid ${COLORS.border}`,
+  borderRadius: "4px",
+  color: COLORS.text,
+  cursor: "pointer",
+  fontSize: "12px",
+};
+
+const RETRY_BTN_STYLE: React.CSSProperties = {
+  ...SYNC_BTN_STYLE,
+  borderColor: COLORS.red,
+  color: COLORS.red,
+};
+
+const PROGRESS_BAR_CONTAINER_STYLE: React.CSSProperties = {
+  marginTop: "8px",
+  width: "100%",
+  height: "6px",
+  background: COLORS.progressBarBg,
+  borderRadius: "3px",
+  overflow: "hidden",
+};
+
+const SPINNER_KEYFRAMES = `
+@keyframes syncstatus-spin {
+  to { transform: rotate(360deg); }
+}
+@keyframes syncstatus-fadein {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+`;
+
+/* ------------------------------------------------------------------ */
+/*  Time-formatting helpers                                            */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Returns a human-readable "X min ago" / "X hours ago" / "X days ago"
+ * string for the given ISO timestamp.  When `offline` is true the suffix
+ * " (offline)" is appended, as the spec requires for stale last-sync
+ * display while disconnected.
+ */
+function formatLastSync(iso: string | null, offline: boolean): string {
+  if (!iso) {
+    return offline ? "Never (offline)" : "Never";
+  }
+  const then = new Date(iso).getTime();
+  if (Number.isNaN(then)) {
+    return offline ? "Unknown (offline)" : "Unknown";
+  }
+  const diffMs = Date.now() - then;
   const diffMin = Math.floor(diffMs / 60000);
 
-  if (diffMin < 1) return "just now";
-  if (diffMin < 60) return `${diffMin}m ago`;
-
-  const diffHr = Math.floor(diffMin / 60);
-  if (diffHr < 24) return `${diffHr}h ago`;
-
-  return date.toLocaleDateString(undefined, { month: "short", day: "numeric" });
-}
-
-/** Full timestamp string for the detail panel and aria-label. */
-function formatLastSyncFull(iso: string | null): string {
-  if (!iso) return "Never";
-  const date = new Date(iso);
-  if (isNaN(date.getTime())) return "Never";
-  return date.toLocaleString(undefined, {
-    month: "short",
-    day: "numeric",
-    hour: "2-digit",
-    minute: "2-digit",
-  });
-}
-
-/** Storage usage as "used / max (pct%)". */
-function formatStorage(usedMb: number, maxMb: number): string {
-  if (maxMb <= 0) return `${usedMb} MB used`;
-  const pct = Math.round((usedMb / maxMb) * 100);
-  return `${usedMb} / ${maxMb} MB (${pct}%)`;
-}
-
-/* ── Component ─────────────────────────────────────────────────────── */
-
-function SyncStatus() {
-  const [status, setStatus] = useState<EdgeSyncStatus | null>(null);
-  const [connectionError, setConnectionError] = useState(false);
-  const [manualSyncing, setManualSyncing] = useState(false);
-  const [lastSyncFailed, setLastSyncFailed] = useState(false);
-  const [hovered, setHovered] = useState(false);
-
-  // Guards against state updates after unmount.
-  const mountedRef = useRef(true);
-
-  /* ── Status polling ────────────────────────────────────────────── */
-
-  const fetchStatus = useCallback(async () => {
-    try {
-      const res = await apiGet<ApiResponse<EdgeSyncStatus>>(
-        "/api/v1/edge/status",
-      );
-      if (!mountedRef.current) return;
-
-      if (res.success && res.data) {
-        setStatus(res.data);
-        setConnectionError(false);
-        // If the backend reports zero pending after a prior failure, clear it.
-        if (res.data.pending_changes === 0) {
-          setLastSyncFailed(false);
-        }
-      } else {
-        setConnectionError(true);
-      }
-    } catch {
-      if (mountedRef.current) {
-        setConnectionError(true);
-      }
-    }
-  }, []);
-
-  useEffect(() => {
-    mountedRef.current = true;
-    fetchStatus();
-
-    const intervalId = setInterval(fetchStatus, POLL_INTERVAL_MS);
-
-    return () => {
-      mountedRef.current = false;
-      clearInterval(intervalId);
-    };
-  }, [fetchStatus]);
-
-  /* ── Manual sync ───────────────────────────────────────────────── */
-
-  const handleManualSync = useCallback(async () => {
-    setManualSyncing(true);
-    try {
-      const res = await apiPost<ApiResponse<SyncResult>>(
-        "/api/v1/edge/sync",
-      );
-      if (!mountedRef.current) return;
-
-      if (res.success && res.data) {
-        setLastSyncFailed(res.data.errors > 0);
-      } else {
-        setLastSyncFailed(true);
-      }
-    } catch {
-      if (mountedRef.current) {
-        setLastSyncFailed(true);
-      }
-    } finally {
-      if (mountedRef.current) {
-        setManualSyncing(false);
-        // Immediately re-fetch status after the sync attempt.
-        fetchStatus();
-      }
-    }
-  }, [fetchStatus]);
-
-  /* ── Derive display state ──────────────────────────────────────── */
-
-  const isSyncing =
-    (status?.sync_in_progress ?? false) || manualSyncing;
-
-  // Determine the high-level state.  Early-return for the "still loading"
-  // case so we don't flash a stale indicator.
-  let syncState: SyncState;
-  if (connectionError) {
-    syncState = "error";
-  } else if (isSyncing) {
-    syncState = "syncing";
-  } else if (!status) {
-    return null; // Initial load — nothing to show yet.
-  } else if (!status.is_online || status.offline_mode) {
-    syncState = "offline";
-  } else if (status.pending_changes > 0 && lastSyncFailed) {
-    syncState = "error";
+  let core: string;
+  if (diffMin < 1) {
+    core = "just now";
+  } else if (diffMin === 1) {
+    core = "1 min ago";
+  } else if (diffMin < 60) {
+    core = `${diffMin} min ago`;
   } else {
-    syncState = "online";
+    const diffHours = Math.floor(diffMin / 60);
+    if (diffHours < 24) {
+      const remainder = diffMin % 60;
+      core =
+        remainder > 0
+          ? `${diffHours}h ${remainder}m ago`
+          : `${diffHours}h ago`;
+    } else {
+      const diffDays = Math.floor(diffHours / 24);
+      core = diffDays === 1 ? "1 day ago" : `${diffDays} days ago`;
+    }
   }
+  return offline ? `${core} (offline)` : core;
+}
 
-  // Hide entirely when edge sync is disabled.
-  if (status && !status.enabled) return null;
-
-  const pending = status?.pending_changes ?? 0;
-  const lastSyncFull = formatLastSyncFull(status?.last_sync ?? null);
-  const lastSyncShort = formatLastSyncShort(status?.last_sync ?? null);
-  const storage = status
-    ? formatStorage(status.storage_used_mb, status.storage_max_mb)
-    : "";
-  const pendingLabel = `${pending} ${pending === 1 ? "change" : "changes"}`;
-
-  /* ── State-specific labels ─────────────────────────────────────── */
-
-  let dotClass: string;
-  let pillText: string;
-  let ariaLabel: string;
-
-  switch (syncState) {
-    case "online":
-      dotClass = "sync-dot-green";
-      pillText = lastSyncShort
-        ? `Up to date · ${lastSyncShort}`
-        : "Up to date";
-      ariaLabel = `Sync up to date. Last synced ${lastSyncFull}.`;
-      break;
-    case "syncing":
-      dotClass = "sync-dot-yellow";
-      pillText = "Syncing...";
-      ariaLabel = "Sync in progress.";
-      break;
-    case "offline":
-      dotClass = "sync-dot-orange";
-      pillText = `Offline — ${pending} ${pending === 1 ? "change" : "changes"} pending`;
-      ariaLabel = `Offline. ${pending} changes pending sync.`;
-      break;
-    case "error":
-      dotClass = "sync-dot-red";
-      if (connectionError) {
-        pillText = "Connection error";
-        ariaLabel = "Cannot reach sync service.";
-      } else {
-        pillText = "Sync error";
-        ariaLabel = `Sync error. ${pending} changes pending.`;
-      }
-      break;
+/**
+ * Returns a compact offline-duration string like "Offline for 2h 15m"
+ * or "Offline for 3m".  Falls back to "Offline" when the start time is
+ * unknown.
+ */
+function formatOfflineDuration(offlineSince: number | null): string {
+  if (offlineSince === null) return "Offline";
+  const diffMs = Date.now() - offlineSince;
+  const totalMin = Math.floor(diffMs / 60000);
+  if (totalMin < 1) return "Offline for <1m";
+  if (totalMin < 60) return `Offline for ${totalMin}m`;
+  const hours = Math.floor(totalMin / 60);
+  const mins = totalMin % 60;
+  if (hours < 24) {
+    return mins > 0 ? `Offline for ${hours}h ${mins}m` : `Offline for ${hours}h`;
   }
+  const days = Math.floor(hours / 24);
+  const remHours = hours % 24;
+  return remHours > 0
+    ? `Offline for ${days}d ${remHours}h`
+    : `Offline for ${days}d`;
+}
 
-  const showRetryButton = syncState === "error" && !connectionError;
-  const showSyncNowDetail = syncState === "online" && pending > 0;
-  const canSync = !isSyncing && !connectionError;
+/**
+ * Formats an error timestamp like "10:32 AM" for display in the error
+ * details section.
+ */
+function formatErrorTime(d: Date): string {
+  return d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+}
 
-  /* ── Render ────────────────────────────────────────────────────── */
+/* ------------------------------------------------------------------ */
+/*  Spinner                                                            */
+/* ------------------------------------------------------------------ */
 
+function Spinner({ color }: { color: string }) {
   return (
-    <div
-      className={`sync-status${hovered ? " sync-status-expanded" : ""}`}
-      role="status"
-      aria-live="polite"
-      aria-label={ariaLabel}
-      onMouseEnter={() => setHovered(true)}
-      onMouseLeave={() => setHovered(false)}
+    <span
       style={{
-        position: "fixed",
-        bottom: "16px",
-        right: "76px",
-        zIndex: 998,
+        display: "inline-block",
+        width: "12px",
+        height: "12px",
+        border: `2px solid ${color}40`,
+        borderTopColor: color,
+        borderRadius: "50%",
+        flexShrink: 0,
+        animation: "syncstatus-spin 0.8s linear infinite",
       }}
-    >
-      {/* ── Pill (always visible) ──────────────────────────────── */}
-      <div
-        className="sync-status-pill"
-        style={{
-          display: "inline-flex",
-          alignItems: "center",
-          gap: "8px",
-          padding: "6px 14px",
-          borderRadius: "20px",
-          backgroundColor: "#16213e",
-          border: "1px solid #2a2a4a",
-          fontSize: "13px",
-          lineHeight: 1,
-          whiteSpace: "nowrap",
-          transition: "all 0.2s ease",
-          cursor: "default",
-          userSelect: "none",
-        }}
-      >
-        {syncState === "syncing" ? (
-          <span
-            className="sync-status-dot sync-spinner sync-dot-yellow"
-            style={{
-              width: "10px",
-              height: "10px",
-              borderRadius: "50%",
-              display: "inline-block",
-              flexShrink: 0,
-              backgroundColor: DOT_COLORS["sync-dot-yellow"],
-            }}
-            aria-hidden="true"
-          />
-        ) : (
-          <span
-            className={`sync-status-dot ${dotClass}`}
-            style={{
-              width: "8px",
-              height: "8px",
-              borderRadius: "50%",
-              display: "inline-block",
-              flexShrink: 0,
-              backgroundColor: DOT_COLORS[dotClass],
-            }}
-            aria-hidden="true"
-          />
-        )}
-
-        <span className="sync-status-text">{pillText}</span>
-
-        {showRetryButton && (
-          <button
-            className="sync-status-button"
-            onClick={handleManualSync}
-            disabled={!canSync}
-            aria-label="Retry sync"
-            style={{
-              marginLeft: "4px",
-              padding: "2px 10px",
-              fontSize: "12px",
-              fontWeight: 600,
-              borderRadius: "12px",
-              border: "1px solid #5a2a2a",
-              backgroundColor: "#3a1a1a",
-              color: "#f87171",
-              cursor: canSync ? "pointer" : "default",
-              transition: "all 0.15s ease",
-            }}
-          >
-            {manualSyncing ? "Retrying..." : "Retry Sync"}
-          </button>
-        )}
-      </div>
-
-      {/* ── Detail panel (on hover) ────────────────────────────── */}
-      {hovered && status && !connectionError && (
-        <div
-          className="sync-status-detail"
-          role="tooltip"
-          style={{
-            position: "absolute",
-            bottom: "100%",
-            right: "0",
-            marginBottom: "8px",
-            padding: "12px 16px",
-            borderRadius: "8px",
-            backgroundColor: "#16213e",
-            border: "1px solid #2a2a4a",
-            fontSize: "13px",
-            lineHeight: 1.6,
-            whiteSpace: "nowrap",
-            boxShadow: "0 4px 16px rgba(0, 0, 0, 0.4)",
-            transition: "opacity 0.2s ease",
-          }}
-        >
-          <div
-            className="sync-status-detail-row"
-            style={{
-              display: "flex",
-              justifyContent: "space-between",
-              gap: "16px",
-            }}
-          >
-            <span style={{ color: "#888" }}>Last sync</span>
-            <span style={{ color: "#e0e0ff" }}>{lastSyncFull}</span>
-          </div>
-
-          <div
-            className="sync-status-detail-row"
-            style={{
-              display: "flex",
-              justifyContent: "space-between",
-              gap: "16px",
-            }}
-          >
-            <span style={{ color: "#888" }}>Storage</span>
-            <span style={{ color: "#e0e0ff" }}>{storage}</span>
-          </div>
-
-          {pending > 0 && (
-            <div
-              className="sync-status-detail-row"
-              style={{
-                display: "flex",
-                justifyContent: "space-between",
-                gap: "16px",
-              }}
-            >
-              <span style={{ color: "#888" }}>Pending</span>
-              <span style={{ color: "#fbbf24" }}>{pendingLabel}</span>
-            </div>
-          )}
-
-          {showSyncNowDetail && (
-            <button
-              className="sync-status-button"
-              onClick={handleManualSync}
-              disabled={!canSync}
-              aria-label="Sync now"
-              style={{
-                marginTop: "8px",
-                width: "100%",
-                padding: "6px 12px",
-                fontSize: "12px",
-                fontWeight: 600,
-                borderRadius: "6px",
-                border: "1px solid #3a3a5a",
-                backgroundColor: "#2a2a4a",
-                color: "#a0a0c0",
-                cursor: canSync ? "pointer" : "default",
-                transition: "all 0.15s ease",
-              }}
-            >
-              Sync Now
-            </button>
-          )}
-        </div>
-      )}
-    </div>
+    />
   );
 }
 
-export default SyncStatus;
+/* ------------------------------------------------------------------ */
+/*  Component                                                          */
+/* ------------------------------------------------------------------ */
+
+const ONLINE_POLL_MS = 5_000;
+const OFFLINE_POLL_MS = 30_000;
+const SYNC_DEBOUNCE_MS = 3_000;
+const PENDING_WARNING_THRESHOLD = 5_000;
+
+export default function SyncStatus() {
+  const { isAuthenticated } = useAuth();
+
+  const [status, setStatus] = useState<EdgeStatus | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [errorExpanded, setErrorExpanded] = useState(false);
+  const [syncBtnDisabled, setSyncBtnDisabled] = useState(false);
+  const [actionError, setActionError] = useState<string | null>(null);
+
+  // Tracks when we first observed an offline state, for the duration counter.
+  const offlineSinceRef = useRef<number | null>(null);
+
+  // Guards against overlapping poll / sync-triggered fetches.
+  const pollingRef = useRef(false);
+
+  /* -------------------------------------------------------------- */
+  /*  Fetch status                                                  */
+  /* -------------------------------------------------------------- */
+
+  const fetchStatus = useCallback(async () => {
+    if (pollingRef.current) return;
+    pollingRef.current = true;
+    try {
+      const data = await apiGet<EdgeStatus>("/api/v1/edge/status");
+      setStatus(data);
+      setActionError(null);
+
+      // Manage offline-since timestamp for the duration counter.
+      if (!data.is_online || data.offline_mode) {
+        if (offlineSinceRef.current === null) {
+          offlineSinceRef.current = Date.now();
+        }
+      } else {
+        offlineSinceRef.current = null;
+      }
+    } catch {
+      // Network failure means we are effectively offline.
+      setStatus((prev) => {
+        if (prev) {
+          // Preserve last known values but mark offline.
+          if (offlineSinceRef.current === null) {
+            offlineSinceRef.current = Date.now();
+          }
+          return { ...prev, is_online: false, offline_mode: true };
+        }
+        // No prior status — synthesise a minimal offline state.
+        if (offlineSinceRef.current === null) {
+          offlineSinceRef.current = Date.now();
+        }
+        return {
+          enabled: true,
+          offline_mode: true,
+          is_online: false,
+          last_sync: null,
+          sync_in_progress: false,
+          pending_changes: 0,
+          conflicts: 0,
+        };
+      });
+    } finally {
+      pollingRef.current = false;
+      setLoading(false);
+    }
+  }, []);
+
+  /* -------------------------------------------------------------- */
+  /*  Polling with adaptive cadence                                 */
+  /* -------------------------------------------------------------- */
+
+  useEffect(() => {
+    if (!isAuthenticated) return;
+
+    // Initial fetch immediately on mount / when auth becomes available.
+    fetchStatus();
+
+    // Set up an adaptive interval.  We use a recursive setTimeout so each
+    // cycle can pick the correct cadence based on the latest status.
+    let timer: ReturnType<typeof setTimeout>;
+
+    const scheduleNext = () => {
+      const isOffline =
+        status === null || !status.is_online || status.offline_mode;
+      const delay = isOffline ? OFFLINE_POLL_MS : ONLINE_POLL_MS;
+      timer = setTimeout(async () => {
+        await fetchStatus();
+        scheduleNext();
+      }, delay);
+    };
+    scheduleNext();
+
+    return () => clearTimeout(timer);
+    // We intentionally re-evaluate when the online/offline flag changes so
+    // the cadence switches.  `fetchStatus` is stable (useCallback with []).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isAuthenticated, status?.is_online, status?.offline_mode, fetchStatus]);
+
+  /* -------------------------------------------------------------- */
+  /*  Offline duration ticker (updates the displayed duration)      */
+  /* -------------------------------------------------------------- */
+
+  const [, setTick] = useState(0);
+  useEffect(() => {
+    if (offlineSinceRef.current === null) return;
+    const id = setInterval(() => setTick((t) => t + 1), 30_000);
+    return () => clearInterval(id);
+  }, [offlineSinceRef.current]);
+
+  /* -------------------------------------------------------------- */
+  /*  Manual sync                                                   */
+  /* -------------------------------------------------------------- */
+
+  const handleSync = useCallback(async () => {
+    if (syncBtnDisabled) return;
+    setSyncBtnDisabled(true);
+    setErrorExpanded(false);
+    setActionError(null);
+
+    // Optimistically mark sync-in-progress for immediate UI feedback.
+    setStatus((prev) =>
+      prev ? { ...prev, sync_in_progress: true, error: null } : prev,
+    );
+
+    try {
+      await apiPost("/api/v1/edge/sync");
+      // Immediately re-fetch to reflect the result.
+      await fetchStatus();
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "Sync request failed";
+      setActionError(msg);
+      setStatus((prev) =>
+        prev ? { ...prev, sync_in_progress: false, error: msg } : prev,
+      );
+      await fetchStatus();
+    } finally {
+      // 3 s debounce: keep the button disabled briefly after completion.
+      setTimeout(() => setSyncBtnDisabled(false), SYNC_DEBOUNCE_MS);
+    }
+  }, [syncBtnDisabled, fetchStatus]);
+
+  /* -------------------------------------------------------------- */
+  /*  Inject keyframes once (guarded against duplication)           */
+  /* -------------------------------------------------------------- */
+
+  useEffect(() => {
+    const id = "syncstatus-keyframes";
+    if (document.getElementById(id)) return;
+    const style = document.createElement("style");
+    style.id = id;
+    style.textContent = SPINNER_KEYFRAMES;
+    document.head.appendChild(style);
+    return () => {
+      const el = document.getElementById(id);
+      if (el) el.remove();
+    };
+  }, []);
+
+  /* -------------------------------------------------------------- */
+  /*  Render guards                                                 */
+  /* -------------------------------------------------------------- */
+
+  if (!isAuthenticated) return null;
+
+  if (loading && !status) {
+    // Minimal placeholder while the first fetch is in flight.
+    return (
+      <div style={CONTAINER_STYLE}>
+        <div style={HEADER_ROW_STYLE}>
+          <Spinner color={COLORS.textMuted} />
+          <span style={MUTED_TEXT_STYLE}>Checking sync status…</span>
+        </div>
+      </div>
+    );
+  }
+
+  if (!status) return null;
+
+  // If edge sync is disabled entirely, show a muted note.
+  if (!status.enabled) {
+    return (
+      <div style={CONTAINER_STYLE}>
+        <div style={HEADER_ROW_STYLE}>
+          <span style={{ ...DOT_STYLE, background: COLORS.textMuted }} />
+          <span>Sync disabled</span>
+        </div>
+        <div style={MUTED_TEXT_STYLE}>
+          Edge sync is not enabled for this device.
+        </div>
+      </div>
+    );
+  }
+
+  /* -------------------------------------------------------------- */
+  /*  Determine the active visual state                             */
+  /* -------------------------------------------------------------- */
+
+  const hasError = !!status.error || !!actionError;
+  const isOffline = !status.is_online || status.offline_mode;
+  const isSyncing = status.sync_in_progress && !hasError;
+
+  const effectiveError = actionError ?? status.error ?? null;
+
+  /* -------------------------------------------------------------- */
+  /*  State: Sync error                                             */
+  /* -------------------------------------------------------------- */
+
+  if (hasError && !isSyncing) {
+    return (
+      <div style={CONTAINER_STYLE}>
+        <div style={HEADER_ROW_STYLE}>
+          <span style={{ ...DOT_STYLE, background: COLORS.red }} />
+          <span style={{ color: COLORS.red, fontWeight: 600 }}>Sync error</span>
+        </div>
+
+        <div
+          onClick={() => setErrorExpanded((v) => !v)}
+          style={{
+            cursor: "pointer",
+            color: COLORS.textMuted,
+            fontSize: "11px",
+            userSelect: "none",
+            marginTop: "4px",
+          }}
+        >
+          {errorExpanded ? "▼ Hide details" : "▶ Show details"}
+        </div>
+
+        {errorExpanded && (
+          <div
+            style={{
+              marginTop: "6px",
+              padding: "8px",
+              background: COLORS.expandBg,
+              borderRadius: "4px",
+              fontSize: "11px",
+              color: COLORS.textMuted,
+              animation: "syncstatus-fadein 0.15s ease",
+            }}
+          >
+            {effectiveError ?? "Unknown error"}
+            <div style={{ marginTop: "4px", fontSize: "10px" }}>
+              {formatErrorTime(new Date())}
+            </div>
+          </div>
+        )}
+
+        {status.pending_changes > 0 && (
+          <div style={{ ...MUTED_TEXT_STYLE, marginTop: "6px" }}>
+            {status.pending_changes.toLocaleString()} change
+            {status.pending_changes === 1 ? "" : "s"} pending
+          </div>
+        )}
+
+        <button
+          style={RETRY_BTN_STYLE}
+          onClick={handleSync}
+          disabled={syncBtnDisabled}
+        >
+          {syncBtnDisabled ? "Retrying…" : "Retry"}
+        </button>
+      </div>
+    );
+  }
+
+  /* -------------------------------------------------------------- */
+  /*  State: Syncing                                                */
+  /* -------------------------------------------------------------- */
+
+  if (isSyncing) {
+    const progress = status.sync_progress;
+    let progressPct = 0;
+    let progressLabel = "Syncing…";
+
+    if (progress) {
+      const pushPct =
+        progress.push_total > 0
+          ? (progress.pushed / progress.push_total) * 100
+          : 100;
+      const pullPct =
+        progress.pull_total > 0
+          ? (progress.pulled / progress.pull_total) * 100
+          : 100;
+      // Overall progress weights push and pull equally.
+      progressPct = Math.round((pushPct + pullPct) / 2);
+
+      const parts: string[] = [];
+      if (progress.push_total > 0) {
+        parts.push(`Pushing ${progress.pushed}/${progress.push_total}`);
+      }
+      if (progress.pull_total > 0) {
+        parts.push(`Pulling ${progress.pulled}/${progress.pull_total} new records`);
+      }
+      progressLabel = parts.join(", ") || "Syncing…";
+    }
+
+    return (
+      <div style={CONTAINER_STYLE}>
+        <div style={HEADER_ROW_STYLE}>
+          <Spinner color={COLORS.yellow} />
+          <span style={{ color: COLORS.yellow, fontWeight: 600 }}>
+            Syncing…
+          </span>
+        </div>
+
+        <div style={{ ...MUTED_TEXT_STYLE, marginTop: "2px" }}>
+          {progressLabel}
+        </div>
+
+        <div style={PROGRESS_BAR_CONTAINER_STYLE}>
+          <div
+            style={{
+              width: `${progressPct}%`,
+              height: "100%",
+              background: COLORS.yellow,
+              borderRadius: "3px",
+              transition: "width 0.3s ease",
+            }}
+          />
+        </div>
+
+        {status.pending_changes > 0 && (
+          <div style={{ ...MUTED_TEXT_STYLE, marginTop: "6px" }}>
+            {status.pending_changes.toLocaleString()} pending
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  /* -------------------------------------------------------------- */
+  /*  State: Offline                                                */
+  /* -------------------------------------------------------------- */
+
+  if (isOffline) {
+    const pending = status.pending_changes;
+    const showQueueWarning = pending > PENDING_WARNING_THRESHOLD;
+
+    return (
+      <div style={CONTAINER_STYLE}>
+        <div style={HEADER_ROW_STYLE}>
+          <span style={{ ...DOT_STYLE, background: COLORS.orange }} />
+          <span style={{ color: COLORS.orange, fontWeight: 600 }}>
+            Offline — {pending.toLocaleString()} change
+            {pending === 1 ? "" : "s"} pending
+          </span>
+        </div>
+
+        <div style={{ ...MUTED_TEXT_STYLE, marginTop: "2px" }}>
+          {formatOfflineDuration(offlineSinceRef.current)}
+        </div>
+
+        <div style={{ ...MUTED_TEXT_STYLE, marginTop: "2px" }}>
+          Last synced: {formatLastSync(status.last_sync, true)}
+        </div>
+
+        {showQueueWarning && (
+          <div
+            style={{
+              marginTop: "6px",
+              padding: "6px 8px",
+              background: `${COLORS.amber}18`,
+              border: `1px solid ${COLORS.amber}50`,
+              borderRadius: "4px",
+              color: COLORS.amber,
+              fontSize: "11px",
+            }}
+          >
+            ⚠ {pending.toLocaleString()} pending changes. Connect to sync soon.
+          </div>
+        )}
+
+        {status.conflicts > 0 && (
+          <div
+            style={{
+              ...MUTED_TEXT_STYLE,
+              marginTop: "6px",
+              color: COLORS.red,
+            }}
+          >
+            {status.conflicts} conflict
+            {status.conflicts === 1 ? "" : "s"} to resolve
+          </div>
+        )}
+
+        <button
+          style={SYNC_BTN_STYLE}
+          onClick={handleSync}
+          disabled={syncBtnDisabled}
+        >
+          {syncBtnDisabled ? "Queued…" : "Retry Sync"}
+        </button>
+      </div>
+    );
+  }
+
+  /* -------------------------------------------------------------- */
+  /*  State: Up to date                                             */
+  /* -------------------------------------------------------------- */
+
+  const pending = status.pending_changes;
+  const showQueueWarning = pending > PENDING_WARNING_THRESHOLD;
+
+  return (
+    <div style={CONTAINER_STYLE}>
+      <div style={HEADER_ROW_STYLE}>
+        <span style={{ ...DOT_STYLE, background: COLORS.green }} />
+        <span style={{ color: COLORS.green, fontWeight: 600 }}>
+          Up to date
+        </span>
+      </div>
+
+      <div style={{ ...MUTED_TEXT_STYLE, marginTop: "2px" }}>
+        Last synced: {formatLastSync(status.last_sync, false)}
+      </div>
+
+      {pending > 0 && (
+        <div style={{ ...MUTED_TEXT_STYLE, marginTop: "2px" }}>
+          {pending.toLocaleString()} change
+          {pending === 1 ? "" : "s"} pending
+        </div>
+      )}
+
+      {showQueueWarning && (
+        <div
+          style={{
+            marginTop: "6px",
+            padding: "6px 8px",
+            background: `${COLORS.amber}18`,
+            border: `1px solid ${COLORS.amber}50`,
+            borderRadius: "4px",
+            color: COLORS.amber,
+            fontSize: "11px",
+          }}
+        >
+          ⚠ {pending.toLocaleString()} pending changes. Connect to sync soon.
+        </div>
+      )}
+
+      {status.conflicts > 0 && (
+        <div
+          style={{
+            ...MUTED_TEXT_STYLE,
+            marginTop: "6px",
+            color: COLORS.red,
+          }}
+        >
+          {status.conflicts} conflict
+          {status.conflicts === 1 ? "" : "s"} to resolve
+        </div>
+      )}
+
+      <button
+        style={SYNC_BTN_STYLE}
+        onClick={handleSync}
+        disabled={syncBtnDisabled}
+        onMouseEnter={(e) => {
+          if (!syncBtnDisabled)
+            e.currentTarget.style.background = COLORS.btnHover;
+        }}
+        onMouseLeave={(e) => {
+          e.currentTarget.style.background = COLORS.btnBg;
+        }}
+      >
+        {syncBtnDisabled ? "Syncing…" : "Sync Now"}
+      </button>
+    </div>
+  );
+}

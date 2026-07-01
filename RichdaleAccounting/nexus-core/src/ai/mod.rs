@@ -1,12 +1,19 @@
 //! AI Module
 //!
 //! This module contains AI-related functionality for the NexusLedger system.
-//! 
+//!
 //! # Submodules
-//! - `ollama`: Ollama integration for local LLM inference
-//! - `embeddings`: Text embedding functionality
-//! - `classification`: Document and transaction classification
-//! - `extraction`: Data extraction from documents
+//! - `ocr`: Mistral OCR4 cloud API integration for image/scanned PDF text extraction
+//! - `pdf`: Local PDF text extraction using pdf-extract (fallback for non-scanned PDFs)
+//! - `embeddings`: Document embedding storage and vector similarity search
+//! - `analysis`: Transaction anomaly detection (rule-based + optional LLM)
+//! - `classification`: Smart account categorization (rule-based + optional GGUF LLM)
+
+pub mod ocr;
+pub mod pdf;
+pub mod embeddings;
+pub mod analysis;
+pub mod classification;
 
 use std::sync::Arc;
 use tokio::sync::Mutex;

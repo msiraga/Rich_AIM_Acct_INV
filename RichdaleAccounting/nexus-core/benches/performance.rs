@@ -1,238 +1,289 @@
-//! Performance benchmarks for NexusLedger ledger operations.
+//! Performance Benchmarks for NexusLedger
 //!
-//! These benchmarks measure the performance of core ledger operations:
-//! - Creating transactions (single and bulk 10K)
-//! - Listing transactions
-//! - Generating balance sheets
-//! - Concurrent write performance under lock contention
+//! Criterion benchmarks measuring throughput and latency for core ledger
+//! operations at scale.
 //!
-//! Run with: `cargo bench --bench performance`
+//! ## Benchmarks
+//!
+//! | Benchmark                     | Description                              | Target  |
+//! |-------------------------------|------------------------------------------|---------|
+//! | `create_10k_transactions`     | Create 10K balanced transactions         | < 2s    |
+//! | `list_10k_transactions`       | List 10K transactions                    | < 500ms |
+//! | `generate_balance_sheet_10k`  | Generate balance sheet (10K txns)        | < 2s    |
+//! | `generate_trial_balance_10k`  | Generate trial balance (10K txns)        | < 1s    |
+//! | `csv_import_10k_rows`         | Import 10K CSV rows (5K txn pairs)       | < 5s    |
+//! | `sync_push_1k_dirty`          | Record 1K transactions (sync throughput) | < 10s   |
+//!
+//! ## Reproducibility
+//!
+//! All benchmark data is deterministic: every transaction uses the same
+//! amount (100), the same accounts (Cash 1000 / Sales Revenue 4000), and
+//! sequential descriptions based on the loop index. No RNG is involved,
+//! ensuring reproducible results across runs.
+//!
+//! Run with: `cargo bench -p nexus-core`
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use std::time::Duration;
-
+use chrono::Utc;
+use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion};
 use nexus_core::accounting::ledger::Ledger;
 use nexus_core::database::financial::{EntryType, Transaction, TransactionEntry};
-
+use nexus_core::utils::import::import_csv;
 use rust_decimal_macros::dec;
+use std::time::Duration;
 use uuid::Uuid;
 
-// ── Helpers ──────────────────────────────────────────────────────────────
+// ── Constants ──────────────────────────────────────────────────────────────
 
-/// Set up a fresh in-memory ledger with default accounts.
-///
-/// Returns the ledger plus the UUIDs of the Cash (1000) and Sales Revenue
-/// (4000) accounts, which are used as the debit/credit pair in benchmark
-/// transactions.
-///
-/// The ledger operates purely in-memory (no SurrealDB persistence, `db`
-/// field is `None`) so that benchmarks measure ledger logic, not database
-/// I/O. This aligns with the < 2-second performance targets.
-async fn setup_ledger() -> (Ledger, Uuid, Uuid) {
+/// Number of transactions for the 10K benchmarks.
+const TRANSACTION_COUNT_10K: usize = 10_000;
+
+/// Number of transactions for the 1K sync benchmark.
+const TRANSACTION_COUNT_1K: usize = 1_000;
+
+/// Number of CSV row pairs (each pair = 1 balanced transaction).
+const CSV_PAIR_COUNT: usize = 5_000;
+
+// ── Helper Functions ───────────────────────────────────────────────────────
+
+/// Create a new `Ledger` and initialize it with the default 20-account chart.
+fn create_initialized_ledger(rt: &tokio::runtime::Runtime) -> Ledger {
     let mut ledger = Ledger::new();
-    ledger.initialize().await.unwrap();
-
-    let cash_id = ledger
-        .get_account_by_number("1000")
-        .await
-        .unwrap()
-        .unwrap()
-        .id;
-    let revenue_id = ledger
-        .get_account_by_number("4000")
-        .await
-        .unwrap()
-        .unwrap()
-        .id;
-
-    (ledger, cash_id, revenue_id)
+    rt.block_on(async {
+        ledger.initialize().await.expect("ledger init failed");
+    });
+    ledger
 }
 
-/// Create a balanced double-entry transaction with two entries (debit + credit).
+/// Look up account IDs for Cash (1000) and Sales Revenue (4000).
+fn get_account_ids(ledger: &Ledger, rt: &tokio::runtime::Runtime) -> (Uuid, Uuid) {
+    rt.block_on(async {
+        let cash = ledger
+            .get_account_by_number("1000")
+            .await
+            .expect("lookup failed")
+            .expect("Cash account 1000 not found");
+        let revenue = ledger
+            .get_account_by_number("4000")
+            .await
+            .expect("lookup failed")
+            .expect("Revenue account 4000 not found");
+        (cash.id, revenue.id)
+    })
+}
+
+/// Populate a ledger with `count` balanced transactions (Dr Cash 100 / Cr Revenue 100).
+fn populate_transactions(
+    ledger: &Ledger,
+    rt: &tokio::runtime::Runtime,
+    count: usize,
+    cash_id: Uuid,
+    revenue_id: Uuid,
+) {
+    rt.block_on(async {
+        for i in 0..count {
+            let txn = make_transaction(cash_id, revenue_id, format!("Setup transaction {i}"));
+            ledger
+                .record_transaction(txn)
+                .await
+                .expect("record_transaction failed");
+        }
+    });
+}
+
+/// Build a balanced transaction: Dr Cash 100, Cr Revenue 100.
+fn make_transaction(cash_id: Uuid, revenue_id: Uuid, description: String) -> Transaction {
+    let entries = vec![
+        TransactionEntry::new(cash_id, EntryType::Debit, dec!(100), "Dr Cash"),
+        TransactionEntry::new(revenue_id, EntryType::Credit, dec!(100), "Cr Revenue"),
+    ];
+    Transaction::new(description, Utc::now(), entries)
+}
+
+/// Generate CSV content with `pairs` balanced transaction pairs (2 data rows per pair).
 ///
-/// The `record_transaction` method overrides `number` with its own sequential
-/// counter, so the number set here is purely for identification.
-fn make_transaction(n: usize, debit_account_id: Uuid, credit_account_id: Uuid) -> Transaction {
-    Transaction {
-        number: format!("TRX-{:06}", n),
-        description: format!("Benchmark transaction {}", n),
-        entries: vec![
-            TransactionEntry {
-                account_id: debit_account_id,
-                entry_type: EntryType::Debit,
-                amount: dec!(100.00),
-                description: "Debit entry".to_string(),
-                ..Default::default()
-            },
-            TransactionEntry {
-                account_id: credit_account_id,
-                entry_type: EntryType::Credit,
-                amount: dec!(100.00),
-                description: "Credit entry".to_string(),
-                ..Default::default()
-            },
-        ],
-        ..Default::default()
+/// Header: `date,description,amount,account,entry_type`
+fn generate_csv_content(pairs: usize) -> String {
+    let mut csv = String::from("date,description,amount,account,entry_type\n");
+    for i in 0..pairs {
+        let desc = format!("CSV Transaction {i}");
+        csv.push_str(&format!("2026-07-01,{desc},100.00,1000,debit\n"));
+        csv.push_str(&format!("2026-07-01,{desc},100.00,4000,credit\n"));
     }
+    csv
 }
 
-// ── Benchmarks ───────────────────────────────────────────────────────────
+// ── Benchmarks ─────────────────────────────────────────────────────────────
 
-/// Benchmark: Create 10,000 transactions in the ledger.
+/// Benchmark 1: Create 10,000 balanced transactions via `record_transaction()`.
 ///
-/// Each transaction has 2 entries (debit/credit). A fresh ledger is set up
-/// for each sample to avoid unbounded growth across iterations.
-///
-/// Target: < 2 seconds.
+/// Each transaction debits Cash (1000) and credits Sales Revenue (4000) for 100.
+/// Fresh ledger per iteration via `iter_batched` to avoid accumulation effects.
+/// Target: < 2s
 fn bench_create_10k_transactions(c: &mut Criterion) {
-    let rt = tokio::runtime::Runtime::new().unwrap();
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
 
     c.bench_function("create_10k_transactions", |b| {
-        b.iter(|| {
-            rt.block_on(async {
-                let (ledger, cash_id, revenue_id) = setup_ledger().await;
-                for i in 0..10_000 {
-                    let txn = make_transaction(i, cash_id, revenue_id);
-                    ledger.record_transaction(txn).await.unwrap();
-                }
-                black_box(());
-            });
-        });
+        b.iter_batched(
+            || {
+                // Setup: fresh initialized ledger + account IDs
+                let ledger = create_initialized_ledger(&rt);
+                let (cash_id, revenue_id) = get_account_ids(&ledger, &rt);
+                (ledger, cash_id, revenue_id)
+            },
+            |(ledger, cash_id, revenue_id)| {
+                // Routine: create 10K transactions
+                rt.block_on(async move {
+                    for i in 0..TRANSACTION_COUNT_10K {
+                        let txn = make_transaction(
+                            cash_id,
+                            revenue_id,
+                            format!("Benchmark transaction {i}"),
+                        );
+                        black_box(ledger.record_transaction(txn).await.unwrap());
+                    }
+                });
+            },
+            BatchSize::PerIteration,
+        );
     });
 }
 
-/// Benchmark: List all transactions after creating 10K.
+/// Benchmark 2: List 10,000 transactions via `list_transactions()`.
 ///
-/// The 10K transactions are pre-populated once (outside the measurement
-/// loop) so that only the listing operation is measured.
-///
-/// Target: < 2 seconds.
+/// Ledger is pre-populated once (not measured); each iteration calls
+/// `list_transactions()` which clones all 10K transactions.
+/// Target: < 500ms
 fn bench_list_10k_transactions(c: &mut Criterion) {
-    let rt = tokio::runtime::Runtime::new().unwrap();
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
 
-    // Pre-populate the ledger with 10K transactions (not measured)
-    let ledger = rt.block_on(async {
-        let (ledger, cash_id, revenue_id) = setup_ledger().await;
-        for i in 0..10_000 {
-            let txn = make_transaction(i, cash_id, revenue_id);
-            ledger.record_transaction(txn).await.unwrap();
-        }
-        ledger
-    });
+    // Pre-populate ledger with 10K transactions (not measured)
+    let ledger = create_initialized_ledger(&rt);
+    let (cash_id, revenue_id) = get_account_ids(&ledger, &rt);
+    populate_transactions(&ledger, &rt, TRANSACTION_COUNT_10K, cash_id, revenue_id);
 
     c.bench_function("list_10k_transactions", |b| {
         b.iter(|| {
-            rt.block_on(async {
-                let txns = ledger.list_transactions().await.unwrap();
-                black_box(txns);
-            });
+            black_box(rt.block_on(ledger.list_transactions()).unwrap());
         });
     });
 }
 
-/// Benchmark: Generate a balance sheet after creating 10K transactions.
+/// Benchmark 3: Generate balance sheet with 10K transactions.
 ///
-/// The 10K transactions are pre-populated once (outside the measurement
-/// loop) so that only the balance sheet generation is measured.
-///
-/// Target: < 2 seconds.
+/// Ledger is pre-populated once (not measured); each iteration calls
+/// `get_balance_sheet()` which iterates all accounts.
+/// Target: < 2s
 fn bench_generate_balance_sheet_10k(c: &mut Criterion) {
-    let rt = tokio::runtime::Runtime::new().unwrap();
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
 
-    // Pre-populate the ledger with 10K transactions (not measured)
-    let ledger = rt.block_on(async {
-        let (ledger, cash_id, revenue_id) = setup_ledger().await;
-        for i in 0..10_000 {
-            let txn = make_transaction(i, cash_id, revenue_id);
-            ledger.record_transaction(txn).await.unwrap();
-        }
-        ledger
-    });
+    // Pre-populate ledger with 10K transactions (not measured)
+    let ledger = create_initialized_ledger(&rt);
+    let (cash_id, revenue_id) = get_account_ids(&ledger, &rt);
+    populate_transactions(&ledger, &rt, TRANSACTION_COUNT_10K, cash_id, revenue_id);
 
     c.bench_function("generate_balance_sheet_10k", |b| {
         b.iter(|| {
-            rt.block_on(async {
-                let bs = ledger.get_balance_sheet().await.unwrap();
-                black_box(bs);
-            });
+            black_box(rt.block_on(ledger.get_balance_sheet()).unwrap());
         });
     });
 }
 
-/// Benchmark: Create a single transaction (comparison baseline).
+/// Benchmark 4: Generate trial balance with 10K transactions.
 ///
-/// A fresh ledger is set up for each sample. The setup cost (account
-/// initialization) is included, making this directly comparable to the
-/// 10K benchmark where the same setup is amortized across 10K transactions.
-fn bench_create_single_transaction(c: &mut Criterion) {
-    let rt = tokio::runtime::Runtime::new().unwrap();
+/// Ledger is pre-populated once (not measured); each iteration calls
+/// `get_trial_balance()` which collects all account balances into a HashMap.
+/// Target: < 1s
+fn bench_generate_trial_balance_10k(c: &mut Criterion) {
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
 
-    c.bench_function("create_single_transaction", |b| {
+    // Pre-populate ledger with 10K transactions (not measured)
+    let ledger = create_initialized_ledger(&rt);
+    let (cash_id, revenue_id) = get_account_ids(&ledger, &rt);
+    populate_transactions(&ledger, &rt, TRANSACTION_COUNT_10K, cash_id, revenue_id);
+
+    c.bench_function("generate_trial_balance_10k", |b| {
         b.iter(|| {
-            rt.block_on(async {
-                let (ledger, cash_id, revenue_id) = setup_ledger().await;
-                let txn = make_transaction(0, cash_id, revenue_id);
-                let recorded = ledger.record_transaction(txn).await.unwrap();
-                black_box(recorded);
-            });
+            black_box(rt.block_on(ledger.get_trial_balance()).unwrap());
         });
     });
 }
 
-/// Benchmark: 10 concurrent writers, each creating 100 transactions.
+/// Benchmark 5: Import 10K CSV rows (5,000 balanced transaction pairs).
 ///
-/// Measures lock contention under concurrent writes. A fresh ledger is
-/// set up for each sample. The `Ledger` is `Clone` (all fields are
-/// `Arc`-backed), so each writer gets a cheap handle to the same
-/// underlying state.
-///
-/// Contention points include:
-/// - `current_transaction_number` Mutex (sequential counter)
-/// - `accounts` RwLock write (balance updates on shared accounts)
-/// - `transactions` RwLock write (BTreeMap insert)
-/// - `journal_entries` RwLock write (journal entry insert)
-fn bench_concurrent_10_writers(c: &mut Criterion) {
-    let rt = tokio::runtime::Runtime::new().unwrap();
+/// Generates 10K CSV data rows once; each iteration imports into a fresh
+/// initialized ledger via `import_csv()`.
+/// Target: < 5s
+fn bench_csv_import_10k_rows(c: &mut Criterion) {
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    let csv_content = generate_csv_content(CSV_PAIR_COUNT);
 
-    c.bench_function("concurrent_10_writers", |b| {
-        b.iter(|| {
-            rt.block_on(async {
-                let (ledger, cash_id, revenue_id) = setup_ledger().await;
-
-                let mut handles = Vec::new();
-                for _ in 0..10 {
-                    let ledger_clone = ledger.clone();
-                    let handle = tokio::spawn(async move {
-                        for i in 0..100 {
-                            let txn = make_transaction(i, cash_id, revenue_id);
-                            ledger_clone.record_transaction(txn).await.unwrap();
-                        }
-                    });
-                    handles.push(handle);
-                }
-
-                for handle in handles {
-                    handle.await.unwrap();
-                }
-
-                black_box(());
-            });
-        });
+    c.bench_function("csv_import_10k_rows", |b| {
+        b.iter_batched(
+            || {
+                // Setup: fresh initialized ledger + cloned CSV (avoids borrow issues)
+                let ledger = create_initialized_ledger(&rt);
+                let csv = csv_content.clone();
+                (ledger, csv)
+            },
+            |(ledger, csv)| {
+                // Routine: import 10K CSV rows
+                black_box(rt.block_on(async move {
+                    import_csv(&ledger, &csv).await.unwrap()
+                }));
+            },
+            BatchSize::PerIteration,
+        );
     });
 }
 
-// ── Criterion setup ──────────────────────────────────────────────────────
+/// Benchmark 6: Simulate sync push of 1K dirty transactions.
+///
+/// Measures `record_transaction()` throughput for 1K transactions on a
+/// fresh ledger, simulating a sync push of dirty (uncommitted) records.
+/// Target: < 10s
+fn bench_sync_push_1k_dirty(c: &mut Criterion) {
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+
+    c.bench_function("sync_push_1k_dirty", |b| {
+        b.iter_batched(
+            || {
+                // Setup: fresh initialized ledger + account IDs
+                let ledger = create_initialized_ledger(&rt);
+                let (cash_id, revenue_id) = get_account_ids(&ledger, &rt);
+                (ledger, cash_id, revenue_id)
+            },
+            |(ledger, cash_id, revenue_id)| {
+                // Routine: create 1K transactions (simulating sync push)
+                rt.block_on(async move {
+                    for i in 0..TRANSACTION_COUNT_1K {
+                        let txn = make_transaction(
+                            cash_id,
+                            revenue_id,
+                            format!("Sync transaction {i}"),
+                        );
+                        black_box(ledger.record_transaction(txn).await.unwrap());
+                    }
+                });
+            },
+            BatchSize::PerIteration,
+        );
+    });
+}
+
+// ── Criterion Entry Point ──────────────────────────────────────────────────
 
 criterion_group! {
     name = benches;
     config = Criterion::default()
-        .sample_size(10)
-        .measurement_time(Duration::from_secs(10));
-    targets = bench_create_10k_transactions,
-              bench_list_10k_transactions,
-              bench_generate_balance_sheet_10k,
-              bench_create_single_transaction,
-              bench_concurrent_10_writers
+        .warm_up_time(Duration::from_secs(3))
+        .measurement_time(Duration::from_secs(5));
+    targets =
+        bench_create_10k_transactions,
+        bench_list_10k_transactions,
+        bench_generate_balance_sheet_10k,
+        bench_generate_trial_balance_10k,
+        bench_csv_import_10k_rows,
+        bench_sync_push_1k_dirty;
 }
 
 criterion_main!(benches);

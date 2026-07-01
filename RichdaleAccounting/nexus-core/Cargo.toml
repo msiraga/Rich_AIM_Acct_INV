@@ -39,8 +39,21 @@ tokio-stream = { workspace = true }
 futures = { workspace = true }
 argon2 = { workspace = true }
 jsonwebtoken = { workspace = true }
+rusqlite = { workspace = true }
+aes-gcm = { workspace = true }
+hkdf = { workspace = true }
+lz4 = { workspace = true }
+rand = { workspace = true }
 governor = { workspace = true }
 prometheus = { workspace = true }
+pdf-extract = { workspace = true }
+llama_cpp_rs = { workspace = true, optional = true }
+zeroize = { workspace = true }
+crc32fast = { workspace = true }
+
+[features]
+default = []
+llm = ["llama_cpp_rs"]
 
 [dev-dependencies]
 tempfile = { workspace = true }

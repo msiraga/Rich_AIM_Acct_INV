@@ -5,21 +5,40 @@
 //!
 //! # Design
 //!
-//! - Uses `rusqlite` for a synchronous, embedded SQLite connection
-//! - `std::sync::Mutex` wraps the connection (SQLite operations are fast and
-//!   blocking; `tokio::task::spawn_blocking` can be used for long queries)
+//! - Uses `rusqlite` (bundled feature) for a synchronous, embedded SQLite connection
+//! - `Arc<std::sync::Mutex<Connection>>` wraps the connection (SQLite operations
+//!   are fast and blocking; `tokio::task::spawn_blocking` can be used for long queries)
+//! - `LocalDb` derives `Clone` — cloning increments the `Arc` refcount, so all
+//!   clones share the same underlying connection and mutex
 //! - Decimal values stored as TEXT to preserve precision
 //! - DateTime values stored as TEXT (RFC 3339)
 //! - UUID values stored as TEXT
 //! - JSON fields (entries, metadata, document_ids, bank_details) stored as TEXT
-//! - Every data table includes `_dirty` and `_modified_at` columns for
-//!   change tracking, plus `created_at` and `updated_at` timestamps
-//! - Versioned SQL migrations applied on first connect
+//! - Every data table includes `_dirty`, `_deleted`, and `_modified_at` columns
+//!   for change tracking, plus `created_at` and `updated_at` timestamps
 //! - Infrastructure tables (`schema_version`, `sync_state`, `changes`) do
 //!   not carry `_dirty` / `_modified_at` since they are not synced entities
+//! - Versioned SQL migrations applied on first connect
+//! - `PRAGMA user_version` tracks schema version alongside the `schema_version` table
+//!
+//! # Schema Overview
+//!
+//! | Table                 | Purpose                                           |
+//! |-----------------------|---------------------------------------------------|
+//! | `accounts`            | Chart of accounts (mirrors SurrealDB `account`)   |
+//! | `transactions`        | Financial transactions (mirrors `transaction`)    |
+//! | `transaction_entries` | Double-entry legs (mirrors `transaction_entry`)   |
+//! | `journal_entries`     | Journal entries (mirrors `journal_entry`)          |
+//! | `invoices`            | Customer invoices                                 |
+//! | `bills`               | Vendor bills                                      |
+//! | `assets`              | Fixed assets                                      |
+//! | `sync_state`          | Singleton row tracking last sync                  |
+//! | `changes`             | Audit log of local changes for sync               |
+//! | `encryption_keys`     | Wrapped DEK + salt for field-level encryption     |
+//! | `conflicts`           | Sync conflict records for resolution              |
 
-use std::sync::Mutex;
-use rusqlite::{Connection, ToSql};
+use std::sync::{Arc, Mutex};
+use rusqlite::{Connection, OpenFlags, ToSql};
 use rusqlite::types::{Value, ValueRef, FromSql};
 use thiserror::Error;
 use tracing::{info, debug, error, warn};
@@ -30,25 +49,41 @@ use chrono::Utc;
 // ═══════════════════════════════════════════════════════════
 
 /// Errors that can occur during local database operations.
+///
+/// The four primary variants (`ConnectionError`, `MigrationError`,
+/// `QueryError`, `NotFound`) cover the main failure modes.  Additional
+/// variants exist for backward compatibility with modules that reference
+/// `InvalidData` and `PoisonedLock`.
 #[derive(Error, Debug)]
 pub enum LocalDbError {
-    /// SQLite database error.
-    #[error("SQLite error: {0}")]
-    Sqlite(#[from] rusqlite::Error),
+    /// Failed to open or connect to the SQLite database.
+    #[error("Connection error: {0}")]
+    ConnectionError(String),
 
-    /// Migration failed.
+    /// A schema migration failed to apply.
     #[error("Migration error: {0}")]
-    Migration(String),
+    MigrationError(String),
 
-    /// Database has not been initialized.
-    #[error("Database not initialized")]
-    NotInitialized,
+    /// A SQL query failed to execute or returned unexpected data.
+    #[error("Query error: {0}")]
+    QueryError(String),
 
-    /// Query returned no rows when one was expected.
+    /// A query expected exactly one row but found none.
     #[error("Record not found")]
     NotFound,
 
+    // ── Backward-compatible variants ─────────────────────
+
+    /// Raw SQLite error (auto-converted via `?`).
+    ///
+    /// Kept so that `From<rusqlite::Error>` is available for `?` syntax
+    /// in methods that call `rusqlite` directly.
+    #[error("SQLite error: {0}")]
+    Sqlite(#[from] rusqlite::Error),
+
     /// Data could not be converted to or from a SQLite value.
+    ///
+    /// Used by `Row::get` and by `tracking::parse_dt`.
     #[error("Invalid data: {0}")]
     InvalidData(String),
 
@@ -59,6 +94,10 @@ pub enum LocalDbError {
     /// The mutex guarding the connection was poisoned.
     #[error("Database lock poisoned")]
     PoisonedLock,
+
+    /// Database has not been initialized.
+    #[error("Database not initialized")]
+    NotInitialized,
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -85,9 +124,6 @@ impl Row {
     }
 
     /// Get a typed value by column name.
-    ///
-    /// # Type parameters
-    /// - `T`: The target type, which must implement `rusqlite::types::FromSql`.
     ///
     /// # Errors
     /// Returns `LocalDbError::InvalidData` if the column is not found or the
@@ -181,9 +217,10 @@ struct Migration {
 ///
 /// Creates all tables for the local SQLite database, mirroring the
 /// SurrealDB schema for seamless synchronization.  Data tables (accounts,
-/// transactions, etc.) carry `_dirty` / `_modified_at` columns for change
-/// tracking; infrastructure tables (schema_version, sync_state, changes)
-/// do not, since they are not synced entities.
+/// transactions, etc.) carry `_dirty` / `_deleted` / `_modified_at` /
+/// `_remote_updated_at` columns for change tracking; infrastructure tables
+/// (schema_version, sync_state, changes) do not, since they are not synced
+/// entities.
 const MIGRATION_001_SQL: &str = r#"
 -- ─── Infrastructure Tables ───
 
@@ -196,24 +233,64 @@ CREATE TABLE IF NOT EXISTS schema_version (
 CREATE TABLE IF NOT EXISTS sync_state (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     last_sync TEXT,
+    last_successful_sync TEXT,
     last_sync_attempt TEXT,
     sync_in_progress INTEGER NOT NULL DEFAULT 0,
     pending_changes INTEGER NOT NULL DEFAULT 0
 );
 
-INSERT OR IGNORE INTO sync_state (id, last_sync, last_sync_attempt, sync_in_progress, pending_changes)
-VALUES (1, NULL, NULL, 0, 0);
+INSERT OR IGNORE INTO sync_state (id, last_sync, last_successful_sync, last_sync_attempt, sync_in_progress, pending_changes)
+VALUES (1, NULL, NULL, NULL, 0, 0);
 
 CREATE TABLE IF NOT EXISTS changes (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     entity_type TEXT NOT NULL,
     entity_id TEXT NOT NULL,
     operation TEXT NOT NULL CHECK (operation IN ('insert', 'update', 'delete')),
-    timestamp TEXT NOT NULL
+    timestamp TEXT NOT NULL,
+    dirty INTEGER NOT NULL DEFAULT 0,
+    synced INTEGER NOT NULL DEFAULT 0,
+    synced_at TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_changes_entity ON changes(entity_type, entity_id);
 CREATE INDEX IF NOT EXISTS idx_changes_timestamp ON changes(timestamp);
+CREATE INDEX IF NOT EXISTS idx_changes_dirty ON changes(dirty);
+CREATE INDEX IF NOT EXISTS idx_changes_synced ON changes(synced);
+
+-- ─── Encryption Keys ───
+
+CREATE TABLE IF NOT EXISTS encryption_keys (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    wrapped_dek BLOB,
+    salt BLOB,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+INSERT OR IGNORE INTO encryption_keys (id, wrapped_dek, salt, created_at, updated_at)
+VALUES (1, NULL, NULL, '', '');
+
+-- ─── Conflicts ───
+
+CREATE TABLE IF NOT EXISTS conflicts (
+    id TEXT PRIMARY KEY,
+    entity_type TEXT NOT NULL,
+    entity_id TEXT NOT NULL,
+    local_version TEXT,
+    remote_version TEXT,
+    diff_fields TEXT,
+    local_modified_at TEXT,
+    remote_modified_at TEXT,
+    status TEXT NOT NULL DEFAULT 'pending',
+    resolution TEXT,
+    resolved_by TEXT,
+    resolved_at TEXT,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_conflicts_entity ON conflicts(entity_type, entity_id);
+CREATE INDEX IF NOT EXISTS idx_conflicts_status ON conflicts(status);
 
 -- ─── Data Tables ───
 
@@ -235,7 +312,9 @@ CREATE TABLE IF NOT EXISTS accounts (
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     _dirty INTEGER NOT NULL DEFAULT 0,
-    _modified_at TEXT
+    _deleted INTEGER NOT NULL DEFAULT 0,
+    _modified_at TEXT,
+    _remote_updated_at TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_accounts_number ON accounts(number);
@@ -243,12 +322,13 @@ CREATE INDEX IF NOT EXISTS idx_accounts_type ON accounts(account_type);
 CREATE INDEX IF NOT EXISTS idx_accounts_parent ON accounts(parent_id);
 CREATE INDEX IF NOT EXISTS idx_accounts_status ON accounts(status);
 CREATE INDEX IF NOT EXISTS idx_accounts_dirty ON accounts(_dirty);
+CREATE INDEX IF NOT EXISTS idx_accounts_deleted ON accounts(_deleted);
 
 -- Transaction entries — mirrors SurrealDB 'transaction_entry' table
 CREATE TABLE IF NOT EXISTS transaction_entries (
     id TEXT PRIMARY KEY,
-    account_id TEXT NOT NULL,
-    transaction_id TEXT,
+    account_id TEXT NOT NULL REFERENCES accounts(id),
+    transaction_id TEXT REFERENCES transactions(id),
     journal_entry_id TEXT,
     entry_type TEXT NOT NULL,
     amount TEXT NOT NULL DEFAULT '0',
@@ -305,7 +385,9 @@ CREATE TABLE IF NOT EXISTS transactions (
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     _dirty INTEGER NOT NULL DEFAULT 0,
-    _modified_at TEXT
+    _deleted INTEGER NOT NULL DEFAULT 0,
+    _modified_at TEXT,
+    _remote_updated_at TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_txn_number ON transactions(number);
@@ -313,6 +395,7 @@ CREATE INDEX IF NOT EXISTS idx_txn_date ON transactions(date);
 CREATE INDEX IF NOT EXISTS idx_txn_status ON transactions(status);
 CREATE INDEX IF NOT EXISTS idx_txn_type ON transactions(transaction_type);
 CREATE INDEX IF NOT EXISTS idx_txn_dirty ON transactions(_dirty);
+CREATE INDEX IF NOT EXISTS idx_txn_deleted ON transactions(_deleted);
 
 -- Invoices
 CREATE TABLE IF NOT EXISTS invoices (
@@ -411,7 +494,8 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 1,
         description: "Initial schema — accounts, transactions, journal_entries, \
-                      transaction_entries, invoices, bills, assets, sync_state, changes",
+                      transaction_entries, invoices, bills, assets, sync_state, changes, \
+                      encryption_keys, conflicts",
         sql: MIGRATION_001_SQL,
     },
 ];
@@ -425,24 +509,26 @@ const LATEST_SCHEMA_VERSION: i32 = 1;
 
 /// Embedded SQLite database for offline-first edge operation.
 ///
-/// Wraps a single `rusqlite::Connection` behind a `std::sync::Mutex`.
-/// The schema mirrors the remote SurrealDB tables so that the sync
-/// engine can push and pull records with minimal transformation.
+/// Wraps a single `rusqlite::Connection` behind an
+/// `Arc<std::sync::Mutex<Connection>>`.  The schema mirrors the remote
+/// SurrealDB tables so that the sync engine can push and pull records with
+/// minimal transformation.
 ///
 /// # Concurrency
 ///
-/// `LocalDb` is `Send + Sync`. For async contexts, wrap long-running
-/// queries in `tokio::task::spawn_blocking` to avoid blocking the
-/// runtime. For shared ownership, wrap in `Arc<LocalDb>`.
+/// `LocalDb` is `Send + Sync + Clone`.  Cloning is cheap — it increments
+/// the `Arc` refcount, so all clones share the same underlying connection
+/// and mutex.  For async contexts, wrap long-running queries in
+/// `tokio::task::spawn_blocking` to avoid blocking the runtime.
 ///
 /// # Why `std::sync::Mutex` (not `tokio::sync::Mutex`)
 ///
-/// SQLite operations are inherently synchronous. Using `std::sync::Mutex`
+/// SQLite operations are inherently synchronous.  Using `std::sync::Mutex`
 /// keeps the API synchronous, avoids async overhead, and aligns with the
 /// tokio team's guidance for guarding short-lived, synchronous resources.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LocalDb {
-    conn: Mutex<Connection>,
+    conn: Arc<Mutex<Connection>>,
     path: String,
 }
 
@@ -451,8 +537,13 @@ impl LocalDb {
 
     /// Open (or create) a SQLite database file at `path` and run migrations.
     ///
-    /// Enables WAL journal mode, foreign-key enforcement, and `synchronous = NORMAL`
-    /// for a good balance of durability and performance on local storage.
+    /// Enables WAL journal mode, foreign-key enforcement, and
+    /// `synchronous = NORMAL` for a good balance of durability and
+    /// performance on local storage.
+    ///
+    /// # Errors
+    /// - [`LocalDbError::ConnectionError`] if the file cannot be opened.
+    /// - [`LocalDbError::MigrationError`] if a migration fails.
     pub fn open(path: &str) -> Result<Self, LocalDbError> {
         // Ensure the parent directory exists
         if let Some(parent) = std::path::Path::new(path).parent() {
@@ -462,7 +553,8 @@ impl LocalDb {
             }
         }
 
-        let conn = Connection::open(path)?;
+        let conn = Connection::open(path)
+            .map_err(|e| LocalDbError::ConnectionError(e.to_string()))?;
 
         // Pragmas — WAL mode, foreign keys, normal sync
         conn.execute_batch(
@@ -474,7 +566,7 @@ impl LocalDb {
         info!("Opened local database at: {}", path);
 
         let db = Self {
-            conn: Mutex::new(conn),
+            conn: Arc::new(Mutex::new(conn)),
             path: path.to_string(),
         };
 
@@ -486,16 +578,32 @@ impl LocalDb {
 
     /// Create an in-memory SQLite database (for testing).
     ///
-    /// Runs migrations so the schema is ready for immediate use.
+    /// Uses a shared-cache URI (`file:edge_mem_<uuid>?mode=memory&cache=shared`)
+    /// so that [`get_connection`](Self::get_connection) can open additional
+    /// connections to the same in-memory database.  Runs migrations so the
+    /// schema is ready for immediate use.
     pub fn open_in_memory() -> Result<Self, LocalDbError> {
-        let conn = Connection::open_in_memory()?;
+        let mem_uri = format!(
+            "file:edge_mem_{}?mode=memory&cache=shared",
+            uuid::Uuid::new_v4()
+        );
+
+        let conn = Connection::open_with_flags(
+            &mem_uri,
+            OpenFlags::SQLITE_OPEN_READ_WRITE
+                | OpenFlags::SQLITE_OPEN_CREATE
+                | OpenFlags::SQLITE_OPEN_URI
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(|e| LocalDbError::ConnectionError(e.to_string()))?;
+
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
 
         debug!("Opened in-memory local database");
 
         let db = Self {
-            conn: Mutex::new(conn),
-            path: ":memory:".to_string(),
+            conn: Arc::new(Mutex::new(conn)),
+            path: mem_uri,
         };
 
         db.run_migrations()?;
@@ -509,6 +617,10 @@ impl LocalDb {
     ///
     /// Idempotent: calling this on an up-to-date database is a no-op.
     /// Each migration is wrapped in a transaction for atomicity.
+    /// After applying, `PRAGMA user_version` is updated to match.
+    ///
+    /// This method is called automatically by [`open`](Self::open) and
+    /// [`open_in_memory`](Self::open_in_memory).
     pub fn run_migrations(&self) -> Result<(), LocalDbError> {
         let mut conn = self.conn.lock().map_err(|_| LocalDbError::PoisonedLock)?;
 
@@ -521,7 +633,7 @@ impl LocalDb {
             );",
         )?;
 
-        // Read the highest applied version
+        // Read the highest applied version from the schema_version table
         let current_version: i32 = conn
             .query_row(
                 "SELECT COALESCE(MAX(version), 0) FROM schema_version",
@@ -530,27 +642,46 @@ impl LocalDb {
             )
             .unwrap_or(0);
 
+        // Also check PRAGMA user_version for consistency
+        let pragma_version: i32 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap_or(0);
+
+        // Use the higher of the two as the effective version
+        let effective_version = current_version.max(pragma_version);
+
         debug!(
-            "Current schema version: {}, latest: {}",
-            current_version, LATEST_SCHEMA_VERSION
+            "Current schema version: {} (table={}, pragma={}), latest: {}",
+            effective_version, current_version, pragma_version, LATEST_SCHEMA_VERSION
         );
 
-        if current_version > LATEST_SCHEMA_VERSION {
+        if effective_version > LATEST_SCHEMA_VERSION {
             warn!(
                 "Database schema version {} is higher than latest known version {} — \
                  possible downgrade",
-                current_version, LATEST_SCHEMA_VERSION
+                effective_version, LATEST_SCHEMA_VERSION
             );
         }
 
-        if current_version >= LATEST_SCHEMA_VERSION {
+        if effective_version >= LATEST_SCHEMA_VERSION {
             debug!("Database schema is up to date");
+            // Ensure PRAGMA user_version is in sync
+            conn.execute_batch(&format!(
+                "PRAGMA user_version = {}",
+                LATEST_SCHEMA_VERSION
+            ))
+            .map_err(|e| {
+                LocalDbError::MigrationError(format!(
+                    "Failed to set PRAGMA user_version: {}",
+                    e
+                ))
+            })?;
             return Ok(());
         }
 
         // Apply each pending migration in order
         for migration in MIGRATIONS {
-            if migration.version > current_version {
+            if migration.version > effective_version {
                 info!(
                     "Applying migration v{}: {}",
                     migration.version, migration.description
@@ -558,7 +689,7 @@ impl LocalDb {
 
                 let tx = conn.transaction()?;
                 tx.execute_batch(migration.sql).map_err(|e| {
-                    LocalDbError::Migration(format!(
+                    LocalDbError::MigrationError(format!(
                         "Migration v{} failed: {}",
                         migration.version, e
                     ))
@@ -570,6 +701,19 @@ impl LocalDb {
                      (version, applied_at, description) VALUES (?1, ?2, ?3)",
                     rusqlite::params![migration.version, now, migration.description],
                 )?;
+
+                // Update PRAGMA user_version within the same transaction
+                tx.execute_batch(&format!(
+                    "PRAGMA user_version = {}",
+                    migration.version
+                ))
+                .map_err(|e| {
+                    LocalDbError::MigrationError(format!(
+                        "Failed to set PRAGMA user_version to {}: {}",
+                        migration.version, e
+                    ))
+                })?;
+
                 tx.commit()?;
 
                 info!("Migration v{} applied successfully", migration.version);
@@ -580,7 +724,19 @@ impl LocalDb {
         Ok(())
     }
 
+    /// Run pending migrations (alias for [`run_migrations`](Self::run_migrations)).
+    ///
+    /// Provided for API symmetry with the task specification.  Internally
+    /// delegates to `run_migrations`, which uses both the `schema_version`
+    /// table and `PRAGMA user_version` for version tracking.
+    pub fn migrate(&self) -> Result<(), LocalDbError> {
+        self.run_migrations()
+    }
+
     /// Return the highest applied schema version, or 0 if none.
+    ///
+    /// Reads from `PRAGMA user_version`, which is kept in sync with the
+    /// `schema_version` table during migration.
     pub fn get_schema_version(&self) -> i32 {
         let conn = match self.conn.lock() {
             Ok(guard) => guard,
@@ -590,17 +746,14 @@ impl LocalDb {
             }
         };
 
-        conn.query_row(
-            "SELECT COALESCE(MAX(version), 0) FROM schema_version",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap_or(0)
+        conn.query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap_or(0)
     }
 
     /// Record that schema version `version` has been applied.
     ///
     /// Uses `INSERT OR IGNORE` so re-applying the same version is a no-op.
+    /// Also updates `PRAGMA user_version` to stay in sync.
     pub fn set_schema_version(&self, version: i32) -> Result<(), LocalDbError> {
         let conn = self.conn.lock().map_err(|_| LocalDbError::PoisonedLock)?;
 
@@ -611,8 +764,59 @@ impl LocalDb {
             rusqlite::params![version, now, format!("Schema version {}", version)],
         )?;
 
+        // Keep PRAGMA user_version in sync
+        conn.execute_batch(&format!("PRAGMA user_version = {}", version))
+            .map_err(|e| {
+                LocalDbError::MigrationError(format!(
+                    "Failed to set PRAGMA user_version: {}",
+                    e
+                ))
+            })?;
+
         debug!("Set schema version to {}", version);
         Ok(())
+    }
+
+    // ── Connection Access ─────────────────────────────────
+
+    /// Open a **new** `Connection` to the same underlying database.
+    ///
+    /// For file-based databases, this opens a second connection to the same
+    /// file with WAL and foreign keys enabled.  For in-memory databases
+    /// (opened via [`open_in_memory`](Self::open_in_memory)), this opens a
+    /// new connection to the same shared-cache in-memory database.
+    ///
+    /// The returned connection is independent of the internal
+    /// `Arc<Mutex<Connection>>` — the caller owns it and is responsible for
+    /// running any necessary pragmas or migrations on it (the base pragmas
+    /// are already applied).
+    ///
+    /// # Errors
+    /// - [`LocalDbError::ConnectionError`] if the connection cannot be opened.
+    pub fn get_connection(&self) -> Result<Connection, LocalDbError> {
+        let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
+            | OpenFlags::SQLITE_OPEN_CREATE
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+
+        // For in-memory databases (shared-cache URI), include SQLITE_OPEN_URI
+        let conn = if self.path.starts_with("file:") {
+            Connection::open_with_flags(
+                &self.path,
+                flags | OpenFlags::SQLITE_OPEN_URI,
+            )
+        } else {
+            Connection::open_with_flags(&self.path, flags)
+        }
+        .map_err(|e| LocalDbError::ConnectionError(e.to_string()))?;
+
+        conn.execute_batch(
+            "PRAGMA journal_mode = WAL;
+             PRAGMA foreign_keys = ON;
+             PRAGMA synchronous = NORMAL;",
+        )
+        .map_err(|e| LocalDbError::ConnectionError(e.to_string()))?;
+
+        Ok(conn)
     }
 
     // ── Query Execution ───────────────────────────────────
@@ -635,24 +839,27 @@ impl LocalDb {
 
     /// Query for a single row.
     ///
-    /// Returns `LocalDbError::NotFound` if no rows match.
+    /// Returns [`LocalDbError::NotFound`] if no rows match.
     pub fn query_one(&self, sql: &str, params: &[&dyn ToSql]) -> Result<Row, LocalDbError> {
         let conn = self.conn.lock().map_err(|_| LocalDbError::PoisonedLock)?;
 
-        match conn.query_row(sql, params, |row| {
-            let count = row.column_count();
-            let mut columns = Vec::with_capacity(count);
-            let mut values = Vec::with_capacity(count);
-            for i in 0..count {
-                columns.push(row.column_name(i)?.to_string());
-                let value: Value = row.get(i)?;
-                values.push(value);
+        let mut stmt = conn.prepare(sql)?;
+        let col_count = stmt.column_count();
+        let col_names: Vec<String> = (0..col_count)
+            .map(|i| stmt.column_name(i).map(|s| s.to_string()).unwrap_or_else(|_| format!("col_{}", i)))
+            .collect();
+
+        let mut rows = stmt.query(params)?;
+        match rows.next()? {
+            Some(row) => {
+                let mut values = Vec::with_capacity(col_count);
+                for i in 0..col_count {
+                    let value: Value = row.get(i)?;
+                    values.push(value);
+                }
+                Ok(Row { columns: col_names, values })
             }
-            Ok(Row { columns, values })
-        }) {
-            Ok(row) => Ok(row),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Err(LocalDbError::NotFound),
-            Err(e) => Err(LocalDbError::Sqlite(e)),
+            None => Err(LocalDbError::NotFound),
         }
     }
 
@@ -662,21 +869,20 @@ impl LocalDb {
     pub fn query_all(&self, sql: &str, params: &[&dyn ToSql]) -> Result<Vec<Row>, LocalDbError> {
         let conn = self.conn.lock().map_err(|_| LocalDbError::PoisonedLock)?;
         let mut stmt = conn.prepare(sql)?;
-        let rows = stmt.query_map(params, |row| {
-            let count = row.column_count();
-            let mut columns = Vec::with_capacity(count);
-            let mut values = Vec::with_capacity(count);
-            for i in 0..count {
-                columns.push(row.column_name(i)?.to_string());
+        let col_count = stmt.column_count();
+        let col_names: Vec<String> = (0..col_count)
+            .map(|i| stmt.column_name(i).map(|s| s.to_string()).unwrap_or_else(|_| format!("col_{}", i)))
+            .collect();
+
+        let mut rows = stmt.query(params)?;
+        let mut result = Vec::new();
+        while let Some(row) = rows.next()? {
+            let mut values = Vec::with_capacity(col_count);
+            for i in 0..col_count {
                 let value: Value = row.get(i)?;
                 values.push(value);
             }
-            Ok(Row { columns, values })
-        })?;
-
-        let mut result = Vec::new();
-        for row in rows {
-            result.push(row?);
+            result.push(Row { columns: col_names.clone(), values });
         }
         Ok(result)
     }
@@ -699,7 +905,7 @@ impl LocalDb {
     pub fn set_last_sync(&self, timestamp: &str) -> Result<(), LocalDbError> {
         let conn = self.conn.lock().map_err(|_| LocalDbError::PoisonedLock)?;
         conn.execute(
-            "UPDATE sync_state SET last_sync = ?1 WHERE id = 1",
+            "UPDATE sync_state SET last_sync = ?1, last_successful_sync = ?1 WHERE id = 1",
             rusqlite::params![timestamp],
         )?;
         debug!("Set last sync to {}", timestamp);
@@ -716,8 +922,8 @@ impl LocalDb {
         let conn = self.conn.lock().map_err(|_| LocalDbError::PoisonedLock)?;
         let now = Utc::now().to_rfc3339();
         conn.execute(
-            "INSERT INTO changes (entity_type, entity_id, operation, timestamp) \
-             VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO changes (entity_type, entity_id, operation, timestamp, dirty) \
+             VALUES (?1, ?2, ?3, ?4, 1)",
             rusqlite::params![entity_type, entity_id, operation, now],
         )?;
         debug!("Recorded change: {} {} {}", operation, entity_type, entity_id);
@@ -726,7 +932,7 @@ impl LocalDb {
 
     // ── Accessors ─────────────────────────────────────────
 
-    /// The filesystem path (or `:memory:`) this database was opened with.
+    /// The filesystem path (or shared-cache URI) this database was opened with.
     pub fn path(&self) -> &str {
         &self.path
     }
@@ -775,7 +981,7 @@ mod tests {
             )
             .expect("Failed to query table names");
         rows.iter()
-            .filter_map(|row| row.get::<String, _>("name").ok())
+            .filter_map(|row| row.get::<String>("name").ok())
             .collect()
     }
 
@@ -786,8 +992,37 @@ mod tests {
             .query_all(&sql, &[])
             .unwrap_or_else(|_| panic!("Failed to query columns for table '{}'", table));
         rows.iter()
-            .filter_map(|row| row.get::<String, _>("name").ok())
+            .filter_map(|row| row.get::<String>("name").ok())
             .collect()
+    }
+
+    /// Collect all index names from `sqlite_master`.
+    fn get_index_names(db: &LocalDb) -> HashSet<String> {
+        let rows = db
+            .query_all(
+                "SELECT name FROM sqlite_master WHERE type = 'index' ORDER BY name",
+                &[],
+            )
+            .expect("Failed to query index names");
+        rows.iter()
+            .filter_map(|row| row.get::<String>("name").ok())
+            .collect()
+    }
+
+    /// Get the value of a PRAGMA setting as a string.
+    fn get_pragma(db: &LocalDb, pragma: &str) -> String {
+        let sql = format!("PRAGMA {}", pragma);
+        let row = db
+            .query_one(&sql, &[])
+            .unwrap_or_else(|_| panic!("Failed to query PRAGMA {}", pragma));
+        // PRAGMA results have a single unnamed column; use index 0.
+        row.get_by_index::<String>(0)
+            .unwrap_or_else(|_| {
+                // Some PRAGMAs return integers
+                row.get_by_index::<i64>(0)
+                    .map(|i| i.to_string())
+                    .unwrap_or_else(|_| "unknown".to_string())
+            })
     }
 
     // ── Open Tests ────────────────────────────────────────
@@ -798,14 +1033,11 @@ mod tests {
         let db_path = dir.path().join("test_edge.db");
         let path_str = db_path.to_str().expect("Path not valid UTF-8");
 
-        // File should not exist yet
         assert!(!db_path.exists(), "Database file should not exist before open");
 
         let db = LocalDb::open(path_str).expect("Failed to open database");
 
-        // File should now exist
         assert!(db_path.exists(), "Database file should exist after open");
-        // Migrations should have been applied
         assert!(
             db.get_schema_version() >= 1,
             "Schema version should be >= 1 after open"
@@ -815,7 +1047,11 @@ mod tests {
     #[test]
     fn test_open_in_memory() {
         let db = LocalDb::open_in_memory().expect("Failed to open in-memory database");
-        assert_eq!(db.path(), ":memory:");
+        assert!(
+            db.path().starts_with("file:edge_mem_"),
+            "In-memory path should be a shared-cache URI, got: {}",
+            db.path()
+        );
         assert!(db.get_schema_version() >= 1);
     }
 
@@ -843,7 +1079,13 @@ mod tests {
         let tables = get_table_names(&db);
 
         // Infrastructure tables
-        for table in &["schema_version", "sync_state", "changes"] {
+        for table in &[
+            "schema_version",
+            "sync_state",
+            "changes",
+            "encryption_keys",
+            "conflicts",
+        ] {
             assert!(
                 tables.contains(*table),
                 "Infrastructure table '{}' should exist",
@@ -876,12 +1118,12 @@ mod tests {
         // After open + migrations, version should be LATEST_SCHEMA_VERSION
         assert_eq!(db.get_schema_version(), LATEST_SCHEMA_VERSION);
 
-        // set_schema_version should insert a new version record
+        // set_schema_version should insert a new version record and update PRAGMA
         db.set_schema_version(99).expect("Failed to set schema version");
         assert_eq!(
             db.get_schema_version(),
             99,
-            "get_schema_version should return max version"
+            "get_schema_version should return max version from PRAGMA user_version"
         );
 
         // Re-setting the same version is a no-op (INSERT OR IGNORE)
@@ -890,11 +1132,24 @@ mod tests {
     }
 
     #[test]
+    fn test_pragma_user_version_set() {
+        let db = make_db();
+
+        // PRAGMA user_version should match LATEST_SCHEMA_VERSION after migrations
+        let user_version = get_pragma(&db, "user_version");
+        assert_eq!(
+            user_version.parse::<i32>().unwrap_or(0),
+            LATEST_SCHEMA_VERSION,
+            "PRAGMA user_version should be {} after migrations",
+            LATEST_SCHEMA_VERSION
+        );
+    }
+
+    #[test]
     fn test_rerunning_migrations_is_idempotent() {
         let db = make_db();
         let version_before = db.get_schema_version();
 
-        // Running migrations again should not error and should not change the version
         db.run_migrations().expect("Re-running migrations should succeed");
 
         let version_after = db.get_schema_version();
@@ -903,11 +1158,25 @@ mod tests {
             "Schema version should not change"
         );
 
-        // Table count should not change
         let tables_before = get_table_names(&db);
         db.run_migrations().expect("Third migration run should succeed");
         let tables_after = get_table_names(&db);
         assert_eq!(tables_before.len(), tables_after.len());
+    }
+
+    #[test]
+    fn test_migrate_alias_works() {
+        let db = make_db();
+        let version_before = db.get_schema_version();
+
+        // migrate() should be equivalent to run_migrations()
+        db.migrate().expect("migrate() should succeed");
+
+        assert_eq!(
+            db.get_schema_version(),
+            version_before,
+            "Schema version should not change after re-running migrate()"
+        );
     }
 
     // ── Column Verification Tests ─────────────────────────
@@ -936,9 +1205,20 @@ mod tests {
             assert!(cols.contains(*col), "accounts should have column '{}'", col);
         }
 
-        // Sync tracking columns
-        for col in &["created_at", "updated_at", "_dirty", "_modified_at"] {
-            assert!(cols.contains(*col), "accounts should have sync column '{}'", col);
+        // Sync tracking columns including new _deleted and _remote_updated_at
+        for col in &[
+            "created_at",
+            "updated_at",
+            "_dirty",
+            "_deleted",
+            "_modified_at",
+            "_remote_updated_at",
+        ] {
+            assert!(
+                cols.contains(*col),
+                "accounts should have sync column '{}'",
+                col
+            );
         }
     }
 
@@ -961,39 +1241,13 @@ mod tests {
             "created_at",
             "updated_at",
             "_dirty",
+            "_deleted",
             "_modified_at",
+            "_remote_updated_at",
         ] {
             assert!(
                 cols.contains(*col),
                 "transactions should have column '{}'",
-                col
-            );
-        }
-    }
-
-    #[test]
-    fn test_journal_entries_table_columns() {
-        let db = make_db();
-        let cols = get_table_columns(&db, "journal_entries");
-
-        for col in &[
-            "id",
-            "number",
-            "date",
-            "description",
-            "reference",
-            "entries",
-            "is_posted",
-            "posted_at",
-            "is_reconciled",
-            "created_at",
-            "updated_at",
-            "_dirty",
-            "_modified_at",
-        ] {
-            assert!(
-                cols.contains(*col),
-                "journal_entries should have column '{}'",
                 col
             );
         }
@@ -1024,6 +1278,120 @@ mod tests {
             assert!(
                 cols.contains(*col),
                 "transaction_entries should have column '{}'",
+                col
+            );
+        }
+    }
+
+    #[test]
+    fn test_encryption_keys_table_columns() {
+        let db = make_db();
+        let cols = get_table_columns(&db, "encryption_keys");
+
+        for col in &["id", "wrapped_dek", "salt", "created_at", "updated_at"] {
+            assert!(
+                cols.contains(*col),
+                "encryption_keys should have column '{}'",
+                col
+            );
+        }
+    }
+
+    #[test]
+    fn test_conflicts_table_columns() {
+        let db = make_db();
+        let cols = get_table_columns(&db, "conflicts");
+
+        for col in &[
+            "id",
+            "entity_type",
+            "entity_id",
+            "local_version",
+            "remote_version",
+            "diff_fields",
+            "local_modified_at",
+            "remote_modified_at",
+            "status",
+            "resolution",
+            "resolved_by",
+            "resolved_at",
+            "created_at",
+        ] {
+            assert!(
+                cols.contains(*col),
+                "conflicts should have column '{}'",
+                col
+            );
+        }
+    }
+
+    #[test]
+    fn test_sync_state_table_columns() {
+        let db = make_db();
+        let cols = get_table_columns(&db, "sync_state");
+
+        for col in &[
+            "id",
+            "last_sync",
+            "last_successful_sync",
+            "last_sync_attempt",
+            "sync_in_progress",
+            "pending_changes",
+        ] {
+            assert!(
+                cols.contains(*col),
+                "sync_state should have column '{}'",
+                col
+            );
+        }
+    }
+
+    #[test]
+    fn test_changes_table_columns() {
+        let db = make_db();
+        let cols = get_table_columns(&db, "changes");
+
+        for col in &[
+            "id",
+            "entity_type",
+            "entity_id",
+            "operation",
+            "timestamp",
+            "dirty",
+            "synced",
+            "synced_at",
+        ] {
+            assert!(
+                cols.contains(*col),
+                "changes should have column '{}'",
+                col
+            );
+        }
+    }
+
+    #[test]
+    fn test_journal_entries_table_columns() {
+        let db = make_db();
+        let cols = get_table_columns(&db, "journal_entries");
+
+        for col in &[
+            "id",
+            "number",
+            "date",
+            "description",
+            "reference",
+            "entries",
+            "is_posted",
+            "posted_at",
+            "is_reconciled",
+            "created_at",
+            "updated_at",
+            "_dirty",
+            "_modified_at",
+        ] {
+            assert!(
+                cols.contains(*col),
+                "journal_entries should have column '{}'",
                 col
             );
         }
@@ -1160,10 +1528,36 @@ mod tests {
     }
 
     #[test]
+    fn test_deleted_and_remote_updated_at_on_synced_tables() {
+        let db = make_db();
+
+        // accounts and transactions should have _deleted and _remote_updated_at
+        for table in &["accounts", "transactions"] {
+            let cols = get_table_columns(&db, table);
+            assert!(
+                cols.contains("_deleted"),
+                "Table '{}' should have _deleted column",
+                table
+            );
+            assert!(
+                cols.contains("_remote_updated_at"),
+                "Table '{}' should have _remote_updated_at column",
+                table
+            );
+        }
+    }
+
+    #[test]
     fn test_infrastructure_tables_have_no_dirty_columns() {
         let db = make_db();
 
-        let infra_tables = ["schema_version", "sync_state", "changes"];
+        let infra_tables = [
+            "schema_version",
+            "sync_state",
+            "changes",
+            "encryption_keys",
+            "conflicts",
+        ];
 
         for table in &infra_tables {
             let cols = get_table_columns(&db, table);
@@ -1180,20 +1574,234 @@ mod tests {
         }
     }
 
+    // ── Index Verification Tests ──────────────────────────
+
+    #[test]
+    fn test_indices_exist() {
+        let db = make_db();
+        let indices = get_index_names(&db);
+
+        // Required indices from the task specification
+        let required_indices = [
+            // _dirty indices
+            "idx_accounts_dirty",
+            "idx_txn_dirty",
+            "idx_je_dirty",
+            "idx_te_dirty",
+            "idx_inv_dirty",
+            "idx_bill_dirty",
+            "idx_asset_dirty",
+            // date indices
+            "idx_txn_date",
+            "idx_je_date",
+            "idx_inv_due_date",
+            "idx_bill_due_date",
+            // account_id index
+            "idx_te_account",
+            // transaction_id index
+            "idx_te_transaction",
+            // entity_type + entity_id index
+            "idx_changes_entity",
+            "idx_conflicts_entity",
+            // status indices
+            "idx_accounts_status",
+            "idx_txn_status",
+            "idx_inv_status",
+            "idx_bill_status",
+            "idx_conflicts_status",
+        ];
+
+        for idx in &required_indices {
+            assert!(
+                indices.contains(*idx),
+                "Index '{}' should exist",
+                idx
+            );
+        }
+    }
+
+    // ── PRAGMA Verification Tests ─────────────────────────
+
+    #[test]
+    fn test_wal_journal_mode() {
+        let dir = tempfile::tempdir().expect("Failed to create temp dir");
+        let db_path = dir.path().join("test_wal.db");
+        let path_str = db_path.to_str().expect("Path not valid UTF-8");
+
+        let db = LocalDb::open(path_str).expect("Failed to open database");
+
+        let journal_mode = get_pragma(&db, "journal_mode");
+        assert_eq!(
+            journal_mode.to_lowercase(),
+            "wal",
+            "journal_mode should be WAL, got: {}",
+            journal_mode
+        );
+    }
+
+    #[test]
+    fn test_foreign_keys_enabled() {
+        let db = make_db();
+        let fk = get_pragma(&db, "foreign_keys");
+        assert_eq!(
+            fk, "1",
+            "foreign_keys should be ON (1), got: {}",
+            fk
+        );
+    }
+
+    // ── FK Enforcement Tests ──────────────────────────────
+
+    #[test]
+    fn test_fk_enforcement_insert_with_nonexistent_account_fails() {
+        let db = make_db();
+
+        // Attempt to insert a transaction_entry with an account_id that
+        // does not exist in the accounts table.  With foreign_keys = ON,
+        // this should fail.
+        let now = Utc::now().to_rfc3339();
+        let result = db.execute(
+            "INSERT INTO transaction_entries \
+             (id, account_id, transaction_id, journal_entry_id, entry_type, amount, \
+              description, reference, currency, exchange_rate, base_currency_amount, \
+              created_at, updated_at, _dirty, _modified_at) \
+             VALUES (?1, ?2, NULL, NULL, ?3, ?4, ?5, NULL, ?6, NULL, NULL, ?7, ?8, 0, ?9)",
+            rusqlite::params![
+                "te-fk-test",
+                "nonexistent-account-id",
+                "Debit",
+                "100",
+                "Test FK",
+                "USD",
+                now,
+                now,
+                now,
+            ],
+        );
+
+        assert!(
+            result.is_err(),
+            "Inserting a transaction_entry with a non-existent account_id should fail with FK enforcement"
+        );
+    }
+
+    #[test]
+    fn test_fk_enforcement_insert_with_valid_account_succeeds() {
+        let db = make_db();
+        let now = Utc::now().to_rfc3339();
+
+        // First, create an account
+        db.execute(
+            "INSERT INTO accounts \
+             (id, number, name, description, account_type, status, balance, currency, \
+              is_bank_account, is_reconciled, created_at, updated_at, _dirty, _deleted) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, 0, ?9, ?10, 0, 0)",
+            rusqlite::params![
+                "acc-fk-valid",
+                "9999",
+                "FK Test Account",
+                "",
+                "Asset",
+                "active",
+                "0",
+                "USD",
+                now,
+                now,
+            ],
+        )
+        .expect("Failed to insert account");
+
+        // Now insert a transaction_entry referencing that account
+        let result = db.execute(
+            "INSERT INTO transaction_entries \
+             (id, account_id, transaction_id, journal_entry_id, entry_type, amount, \
+              description, reference, currency, exchange_rate, base_currency_amount, \
+              created_at, updated_at, _dirty, _modified_at) \
+             VALUES (?1, ?2, NULL, NULL, ?3, ?4, ?5, NULL, ?6, NULL, NULL, ?7, ?8, 0, ?9)",
+            rusqlite::params![
+                "te-fk-valid",
+                "acc-fk-valid",
+                "Debit",
+                "100",
+                "Test FK valid",
+                "USD",
+                now,
+                now,
+                now,
+            ],
+        );
+
+        assert!(
+            result.is_ok(),
+            "Inserting a transaction_entry with a valid account_id should succeed"
+        );
+    }
+
+    #[test]
+    fn test_fk_allows_null_transaction_id() {
+        let db = make_db();
+        let now = Utc::now().to_rfc3339();
+
+        // Create an account first
+        db.execute(
+            "INSERT INTO accounts \
+             (id, number, name, description, account_type, status, balance, currency, \
+              is_bank_account, is_reconciled, created_at, updated_at, _dirty, _deleted) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, 0, ?9, ?10, 0, 0)",
+            rusqlite::params![
+                "acc-null-fk",
+                "8888",
+                "Null FK Test",
+                "",
+                "Asset",
+                "active",
+                "0",
+                "USD",
+                now,
+                now,
+            ],
+        )
+        .expect("Failed to insert account");
+
+        // Insert a transaction_entry with NULL transaction_id (should succeed)
+        let result = db.execute(
+            "INSERT INTO transaction_entries \
+             (id, account_id, transaction_id, journal_entry_id, entry_type, amount, \
+              description, reference, currency, exchange_rate, base_currency_amount, \
+              created_at, updated_at, _dirty, _modified_at) \
+             VALUES (?1, ?2, NULL, NULL, ?3, ?4, ?5, NULL, ?6, NULL, NULL, ?7, ?8, 0, ?9)",
+            rusqlite::params![
+                "te-null-fk",
+                "acc-null-fk",
+                "Debit",
+                "50",
+                "Null FK",
+                "USD",
+                now,
+                now,
+                now,
+            ],
+        );
+
+        assert!(
+            result.is_ok(),
+            "Inserting a transaction_entry with NULL transaction_id should succeed (FK allows NULL)"
+        );
+    }
+
     // ── CRUD / Query Tests ────────────────────────────────
 
     #[test]
     fn test_execute_insert_and_query() {
         let db = make_db();
 
-        // Insert an account
         let account_id = uuid::Uuid::new_v4().to_string();
-        let now = chrono::Utc::now().to_rfc3339();
+        let now = Utc::now().to_rfc3339();
         db.execute(
             "INSERT INTO accounts \
              (id, number, name, description, account_type, status, balance, currency, \
-              is_bank_account, is_reconciled, created_at, updated_at, _dirty) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+              is_bank_account, is_reconciled, created_at, updated_at, _dirty, _deleted) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             rusqlite::params![
                 account_id,
                 "1000",
@@ -1208,23 +1816,24 @@ mod tests {
                 now,
                 now,
                 1,
+                0,
             ],
         )
         .expect("Failed to insert account");
 
-        // Query it back
         let row = db
             .query_one(
-                "SELECT id, number, name, account_type, _dirty FROM accounts WHERE number = ?1",
+                "SELECT id, number, name, account_type, _dirty, _deleted FROM accounts WHERE number = ?1",
                 rusqlite::params!["1000"],
             )
             .expect("Failed to query account");
 
-        assert_eq!(row.get::<String, _>("id").unwrap(), account_id);
-        assert_eq!(row.get::<String, _>("number").unwrap(), "1000");
-        assert_eq!(row.get::<String, _>("name").unwrap(), "Cash");
-        assert_eq!(row.get::<String, _>("account_type").unwrap(), "Asset");
-        assert_eq!(row.get::<i64, _>("_dirty").unwrap(), 1);
+        assert_eq!(row.get::<String>("id").unwrap(), account_id);
+        assert_eq!(row.get::<String>("number").unwrap(), "1000");
+        assert_eq!(row.get::<String>("name").unwrap(), "Cash");
+        assert_eq!(row.get::<String>("account_type").unwrap(), "Asset");
+        assert_eq!(row.get::<i64>("_dirty").unwrap(), 1);
+        assert_eq!(row.get::<i64>("_deleted").unwrap(), 0);
     }
 
     #[test]
@@ -1256,15 +1865,14 @@ mod tests {
     #[test]
     fn test_query_all_multiple_rows() {
         let db = make_db();
-        let now = chrono::Utc::now().to_rfc3339();
+        let now = Utc::now().to_rfc3339();
 
-        // Insert multiple accounts
         for i in 1..=5 {
             db.execute(
                 "INSERT INTO accounts \
                  (id, number, name, description, account_type, status, balance, currency, \
-                  is_bank_account, is_reconciled, created_at, updated_at, _dirty) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                  is_bank_account, is_reconciled, created_at, updated_at, _dirty, _deleted) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
                 rusqlite::params![
                     uuid::Uuid::new_v4().to_string(),
                     format!("{}{}", i, "00"),
@@ -1278,6 +1886,7 @@ mod tests {
                     0,
                     now,
                     now,
+                    0,
                     0,
                 ],
             )
@@ -1301,23 +1910,47 @@ mod tests {
             .query_one("SELECT * FROM sync_state WHERE id = 1", &[])
             .expect("sync_state singleton should exist");
 
-        assert_eq!(row.get::<i64, _>("id").unwrap(), 1);
-        assert!(row.get::<Option<String>, _>("last_sync").unwrap().is_none());
-        assert_eq!(row.get::<i64, _>("sync_in_progress").unwrap(), 0);
+        assert_eq!(row.get::<i64>("id").unwrap(), 1);
+        assert!(row.get::<Option<String>>("last_sync").unwrap().is_none());
+        assert!(row
+            .get::<Option<String>>("last_successful_sync")
+            .unwrap()
+            .is_none());
+        assert_eq!(row.get::<i64>("sync_in_progress").unwrap(), 0);
+    }
+
+    #[test]
+    fn test_encryption_keys_singleton_exists() {
+        let db = make_db();
+
+        let row = db
+            .query_one("SELECT * FROM encryption_keys WHERE id = 1", &[])
+            .expect("encryption_keys singleton should exist");
+
+        assert_eq!(row.get::<i64>("id").unwrap(), 1);
+        assert!(row.get::<Option<Vec<u8>>>("wrapped_dek").unwrap().is_none());
+        assert!(row.get::<Option<Vec<u8>>>("salt").unwrap().is_none());
     }
 
     #[test]
     fn test_get_and_set_last_sync() {
         let db = make_db();
 
-        // Initially no sync has occurred
         assert!(db.get_last_sync().is_none());
 
-        // Set a sync timestamp
         let ts = "2026-07-01T12:00:00Z";
         db.set_last_sync(ts).expect("Failed to set last sync");
 
         assert_eq!(db.get_last_sync().as_deref(), Some(ts));
+
+        // last_successful_sync should also be updated
+        let row = db
+            .query_one("SELECT last_successful_sync FROM sync_state WHERE id = 1", &[])
+            .expect("Failed to query last_successful_sync");
+        assert_eq!(
+            row.get::<Option<String>>("last_successful_sync").unwrap().as_deref(),
+            Some(ts)
+        );
     }
 
     #[test]
@@ -1338,13 +1971,15 @@ mod tests {
         assert_eq!(rows.len(), 3);
 
         let first = &rows[0];
-        assert_eq!(first.get::<String, _>("entity_type").unwrap(), "account");
-        assert_eq!(first.get::<String, _>("entity_id").unwrap(), "uuid-123");
-        assert_eq!(first.get::<String, _>("operation").unwrap(), "insert");
+        assert_eq!(first.get::<String>("entity_type").unwrap(), "account");
+        assert_eq!(first.get::<String>("entity_id").unwrap(), "uuid-123");
+        assert_eq!(first.get::<String>("operation").unwrap(), "insert");
+        // dirty should be 1 (set by record_change)
+        assert_eq!(first.get::<i64>("dirty").unwrap(), 1);
 
         let third = &rows[2];
-        assert_eq!(third.get::<String, _>("entity_type").unwrap(), "invoice");
-        assert_eq!(third.get::<String, _>("operation").unwrap(), "delete");
+        assert_eq!(third.get::<String>("entity_type").unwrap(), "invoice");
+        assert_eq!(third.get::<String>("operation").unwrap(), "delete");
     }
 
     // ── Row Type Tests ────────────────────────────────────
@@ -1352,13 +1987,13 @@ mod tests {
     #[test]
     fn test_row_get_by_name_and_index() {
         let db = make_db();
-        let now = chrono::Utc::now().to_rfc3339();
+        let now = Utc::now().to_rfc3339();
 
         db.execute(
             "INSERT INTO accounts \
              (id, number, name, description, account_type, status, balance, currency, \
-              is_bank_account, is_reconciled, created_at, updated_at, _dirty) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+              is_bank_account, is_reconciled, created_at, updated_at, _dirty, _deleted) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             rusqlite::params![
                 "test-id",
                 "5000",
@@ -1373,6 +2008,7 @@ mod tests {
                 now,
                 now,
                 0,
+                0,
             ],
         )
         .expect("Failed to insert");
@@ -1384,12 +2020,10 @@ mod tests {
             )
             .expect("Failed to query");
 
-        // By name
-        assert_eq!(row.get::<String, _>("id").unwrap(), "test-id");
-        assert_eq!(row.get::<String, _>("number").unwrap(), "5000");
-        assert_eq!(row.get::<i64, _>("is_bank_account").unwrap(), 1);
+        assert_eq!(row.get::<String>("id").unwrap(), "test-id");
+        assert_eq!(row.get::<String>("number").unwrap(), "5000");
+        assert_eq!(row.get::<i64>("is_bank_account").unwrap(), 1);
 
-        // By index
         assert_eq!(row.get_by_index::<String>(0).unwrap(), "test-id");
         assert_eq!(row.get_by_index::<String>(1).unwrap(), "5000");
         assert_eq!(row.get_by_index::<i64>(3).unwrap(), 1);
@@ -1417,23 +2051,204 @@ mod tests {
         assert!(matches!(result, Err(LocalDbError::InvalidData(_))));
     }
 
+    #[test]
+    fn test_row_default() {
+        let row = Row::default();
+        assert!(row.is_empty());
+        assert_eq!(row.column_count(), 0);
+        assert!(row.columns().is_empty());
+    }
+
+    #[test]
+    fn test_row_clone() {
+        let row = Row::new(
+            vec!["col".to_string()],
+            vec![Value::Text("value".to_string())],
+        );
+        let cloned = row.clone();
+        assert_eq!(cloned.get::<String>("col").unwrap(), "value");
+    }
+
+    // ── get_connection Tests ──────────────────────────────
+
+    #[test]
+    fn test_get_connection_file_based() {
+        let dir = tempfile::tempdir().expect("Failed to create temp dir");
+        let db_path = dir.path().join("test_gc.db");
+        let path_str = db_path.to_str().expect("Path not valid UTF-8");
+
+        let db = LocalDb::open(path_str).expect("Failed to open database");
+
+        // Insert data via the main connection
+        let now = Utc::now().to_rfc3339();
+        db.execute(
+            "INSERT INTO accounts \
+             (id, number, name, description, account_type, status, balance, currency, \
+              is_bank_account, is_reconciled, created_at, updated_at, _dirty, _deleted) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            rusqlite::params![
+                "gc-test-id",
+                "7777",
+                "GC Test",
+                "",
+                "Asset",
+                "active",
+                "0",
+                "USD",
+                0,
+                0,
+                now,
+                now,
+                0,
+                0,
+            ],
+        )
+        .expect("Failed to insert via main connection");
+
+        // Open a new connection and verify the data is visible
+        let conn = db.get_connection().expect("Failed to get connection");
+
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM accounts WHERE number = ?1",
+                rusqlite::params!["7777"],
+                |row| row.get(0),
+            )
+            .expect("Failed to query via new connection");
+
+        assert_eq!(count, 1, "New connection should see data from the main connection");
+    }
+
+    #[test]
+    fn test_get_connection_in_memory() {
+        let db = make_db();
+
+        // Insert data via the main connection
+        let now = Utc::now().to_rfc3339();
+        db.execute(
+            "INSERT INTO accounts \
+             (id, number, name, description, account_type, status, balance, currency, \
+              is_bank_account, is_reconciled, created_at, updated_at, _dirty, _deleted) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            rusqlite::params![
+                "mem-gc-id",
+                "6666",
+                "Mem GC Test",
+                "",
+                "Asset",
+                "active",
+                "0",
+                "USD",
+                0,
+                0,
+                now,
+                now,
+                0,
+                0,
+            ],
+        )
+        .expect("Failed to insert via main connection");
+
+        // Open a new connection — for in-memory shared-cache, it should see the same data
+        let conn = db.get_connection().expect("Failed to get connection");
+
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM accounts WHERE number = ?1",
+                rusqlite::params!["6666"],
+                |row| row.get(0),
+            )
+            .expect("Failed to query via new connection");
+
+        assert_eq!(
+            count, 1,
+            "New in-memory connection should see data from the main connection (shared cache)"
+        );
+    }
+
+    // ── Clone Tests ───────────────────────────────────────
+
+    #[test]
+    fn test_clone_shares_connection() {
+        let db = make_db();
+        let now = Utc::now().to_rfc3339();
+
+        // Insert via the original
+        db.execute(
+            "INSERT INTO accounts \
+             (id, number, name, description, account_type, status, balance, currency, \
+              is_bank_account, is_reconciled, created_at, updated_at, _dirty, _deleted) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            rusqlite::params![
+                "clone-test-id",
+                "5555",
+                "Clone Test",
+                "",
+                "Asset",
+                "active",
+                "0",
+                "USD",
+                0,
+                0,
+                now,
+                now,
+                0,
+                0,
+            ],
+        )
+        .expect("Failed to insert via original");
+
+        // Clone and query via the clone
+        let db_clone = db.clone();
+        let row = db_clone
+            .query_one(
+                "SELECT number FROM accounts WHERE id = ?1",
+                rusqlite::params!["clone-test-id"],
+            )
+            .expect("Failed to query via clone");
+
+        assert_eq!(row.get::<String>("number").unwrap(), "5555");
+    }
+
     // ── Error Display Tests ───────────────────────────────
 
     #[test]
     fn test_error_display() {
-        let e = LocalDbError::NotInitialized;
-        assert_eq!(format!("{}", e), "Database not initialized");
+        let e = LocalDbError::ConnectionError("cannot open file".to_string());
+        assert_eq!(format!("{}", e), "Connection error: cannot open file");
+
+        let e = LocalDbError::MigrationError("v1 failed".to_string());
+        assert_eq!(format!("{}", e), "Migration error: v1 failed");
+
+        let e = LocalDbError::QueryError("syntax error".to_string());
+        assert_eq!(format!("{}", e), "Query error: syntax error");
 
         let e = LocalDbError::NotFound;
         assert_eq!(format!("{}", e), "Record not found");
 
-        let e = LocalDbError::Migration("test migration error".to_string());
-        assert_eq!(format!("{}", e), "Migration error: test migration error");
+        let e = LocalDbError::NotInitialized;
+        assert_eq!(format!("{}", e), "Database not initialized");
 
         let e = LocalDbError::InvalidData("bad value".to_string());
         assert_eq!(format!("{}", e), "Invalid data: bad value");
 
         let e = LocalDbError::PoisonedLock;
         assert_eq!(format!("{}", e), "Database lock poisoned");
+    }
+
+    #[test]
+    fn test_error_from_rusqlite() {
+        // Verify that rusqlite::Error auto-converts to LocalDbError
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let sqlite_err = conn.execute_batch("INVALID SQL").unwrap_err();
+        let db_err: LocalDbError = sqlite_err.into();
+        assert!(matches!(db_err, LocalDbError::Sqlite(_)));
+    }
+
+    #[test]
+    fn test_error_from_io() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "file not found");
+        let db_err: LocalDbError = io_err.into();
+        assert!(matches!(db_err, LocalDbError::Io(_)));
     }
 }

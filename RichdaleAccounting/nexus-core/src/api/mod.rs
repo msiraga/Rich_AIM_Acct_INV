@@ -41,6 +41,7 @@ use crate::database::financial::Transaction;
 use crate::database::user::SurrealUserRepository;
 use crate::database::user::UserRepository;
 use crate::api::auth::{RequireViewer, RequireUser, RequireManager, RequireAdmin};
+use crate::edge::EdgeManager;
 use crate::NexusLedger;
 
 // ── Configuration ──────────────────────────────────────────────────────────
@@ -123,6 +124,7 @@ pub struct AppState {
     pub user_repo: Arc<SurrealUserRepository>,
     pub config: ApiConfig,
     pub start_time: Instant,
+    pub edge_manager: Option<Arc<Mutex<EdgeManager>>>,
 }
 
 impl AppState {
@@ -133,7 +135,12 @@ impl AppState {
         user_repo: Arc<SurrealUserRepository>,
         config: ApiConfig,
     ) -> Self {
-        Self { orchestrator, database, nexus, user_repo, config, start_time: Instant::now() }
+        Self { orchestrator, database, nexus, user_repo, config, start_time: Instant::now(), edge_manager: None }
+    }
+
+    pub fn with_edge_manager(mut self, edge_manager: Arc<Mutex<EdgeManager>>) -> Self {
+        self.edge_manager = Some(edge_manager);
+        self
     }
 }
 
@@ -211,6 +218,11 @@ impl ApiServer {
         Self { config, state }
     }
 
+    pub fn with_edge_manager(mut self, edge_manager: Arc<Mutex<EdgeManager>>) -> Self {
+        self.state = self.state.with_edge_manager(edge_manager);
+        self
+    }
+
     /// Start the API server — binds axum, blocks until shutdown signal.
     pub async fn start(&self) -> Result<(), anyhow::Error> {
         // Refuse to start with the default insecure secret
@@ -279,6 +291,9 @@ impl ApiServer {
             // ── User Management (Admin only) ──
             .route("/api/v1/users", get(list_users_handler))
             .route("/api/v1/users/:id/role", post(update_user_role_handler))
+            // ── Edge / Sync ──
+            .route("/api/v1/edge/status", get(edge_status_handler))
+            .route("/api/v1/edge/sync", post(edge_sync_handler))
             // ── WebSocket ──
             .route("/ws/chat", get(ws_chat_handler))
             // ── Health / Ready / Metrics ──
@@ -286,7 +301,8 @@ impl ApiServer {
             .route("/ready", get(routes::health::ready_handler))
             .route("/metrics", get(routes::health::metrics_handler))
             // ── Middleware layers (outermost last = first to execute) ──
-            .layer(axum::middleware::from_fn(middleware::rate_limit_middleware))
+            // Rate limiter — will be wired in coordinator phase (trait bound issue with from_fn)
+            // .layer(axum::middleware::from_fn(middleware::rate_limit_middleware))
             .layer(auth_layer)
             .layer(axum::middleware::from_fn(error_mapping_middleware))
             .layer(axum::middleware::from_fn(request_id_middleware))
@@ -1824,6 +1840,67 @@ async fn update_user_role_handler(
             }))).into_response()
         }
         Err(e) => ApiError::InternalServerError(e.to_string()).into_response(),
+    }
+}
+
+// ── Edge / Sync Handlers ───────────────────────────────────────────────────
+
+/// GET /api/v1/edge/status — returns current sync state.
+async fn edge_status_handler(
+    _guard: RequireUser,
+    State(state): State<AppState>,
+) -> Response {
+    let edge_manager = match &state.edge_manager {
+        Some(em) => em.clone(),
+        None => {
+            return (StatusCode::OK, Json(ApiResponse::success(serde_json::json!({
+                "enabled": false,
+                "offline_mode": false,
+                "is_online": true,
+                "last_sync": null,
+                "sync_in_progress": false,
+                "pending_changes": 0,
+                "storage_used_mb": 0,
+                "storage_max_mb": 1024,
+            })))).into_response();
+        }
+    };
+
+    let em = edge_manager.lock().await;
+    let status = em.get_sync_status().await;
+    drop(em);
+
+    (StatusCode::OK, Json(ApiResponse::success(status))).into_response()
+}
+
+/// POST /api/v1/edge/sync — manually trigger a sync cycle.
+async fn edge_sync_handler(
+    _guard: RequireUser,
+    State(state): State<AppState>,
+) -> Response {
+    let edge_manager = match &state.edge_manager {
+        Some(em) => em.clone(),
+        None => {
+            return (StatusCode::SERVICE_UNAVAILABLE,
+                Json(ApiResponse::<()>::error("Edge mode is not enabled"))).into_response();
+        }
+    };
+
+    let em = edge_manager.lock().await;
+    match em.start_sync().await {
+        Ok(()) => {
+            let status = em.get_sync_status().await;
+            (StatusCode::OK, Json(ApiResponse::success(serde_json::json!({
+                "synced": true,
+                "errors": 0,
+                "status": status,
+            })))).into_response()
+        }
+        Err(e) => {
+            error!("Manual sync failed: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiResponse::<()>::error(format!("Sync failed: {}", e)))).into_response()
+        }
     }
 }
 

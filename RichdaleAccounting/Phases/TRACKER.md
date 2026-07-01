@@ -1,7 +1,7 @@
 # NexusLedger — Execution Tracker
 
-**Track progress automatically.** Check off tasks as completed.  
-Last updated: 2026-06-30
+**Track progress automatically.** Check off tasks as completed.
+Last updated: 2026-07-01
 
 ---
 
@@ -212,32 +212,32 @@ Last updated: 2026-06-30
 
 ## Phase 6: Edge & Sync
 
-**Status:** Not started (blocked by P5)  
-**Started:** —  
-**Completed:** —
+**Status:** ✅ COMPLETED
+**Started:** 2026-07-01
+**Completed:** 2026-07-01
 
 | ID | Task | Status |
 |---|---|---|
-| 6.1 | Embedded SQLite local database | [ ] |
-| 6.2 | Local data store CRUD | [ ] |
-| 6.3 | Change tracking (_dirty flags) | [ ] |
-| 6.4 | Sync engine (push + pull) | [ ] |
-| 6.5 | Conflict resolution (last-write-wins) | [ ] |
-| 6.6 | Offline mode toggle | [ ] |
-| 6.7 | Sync status UI component | [ ] |
-| 6.8 | Local encryption (AES-256-GCM) | [ ] |
-| 6.9 | Local compression (lz4) | [ ] |
-| 6.10 | Integration test: offline → online → sync | [ ] |
+| 6.1 | Embedded SQLite local database | [x] |
+| 6.2 | Local data store CRUD | [x] |
+| 6.3 | Change tracking (_dirty flags) | [x] |
+| 6.4 | Sync engine (push + pull) | [x] |
+| 6.5 | Conflict resolution (last-write-wins) | [x] |
+| 6.6 | Offline mode toggle | [x] |
+| 6.7 | Sync status UI component | [x] |
+| 6.8 | Local encryption (AES-256-GCM) | [x] |
+| 6.9 | Local compression (lz4) | [x] |
+| 6.10 | Integration test: offline → online → sync | [x] |
 
 ### Freeze Token 6
 
 | # | Condition | Status |
 |---|---|---|
-| 🔒 | Offline CRUD works against SQLite | [ ] |
-| 🔒 | Online → push dirty records to SurrealDB | [ ] |
-| 🔒 | Pull remote changes to local | [ ] |
-| 🔒 | Conflict logged, not lost | [ ] |
-| 🔒 | Sensitive fields encrypted at rest | [ ] |
+| 🔒 | Offline CRUD works against SQLite | [x] |
+| 🔒 | Online → push dirty records to SurrealDB | [x] |
+| 🔒 | Pull remote changes to local | [x] |
+| 🔒 | Conflict logged, not lost | [x] |
+| 🔒 | Sensitive fields encrypted at rest | [x] |
 
 ---
 

@@ -5,8 +5,10 @@
 //!
 //! # Endpoints
 //! - `GET /health`  — liveness probe (always 200 if the process is alive)
-//! - `GET /ready`   — readiness probe (200 if DB connected + agents initialized, 503 otherwise)
-//! - `GET /metrics` — Prometheus text-format metrics (404 if Prometheus is not enabled)
+//! - `GET /ready`   — readiness probe (200 if DB connected + orchestrator
+//!                    running + ledger seeded, 503 otherwise)
+//! - `GET /metrics` — Prometheus text-format metrics (404 if Prometheus
+//!                    is not enabled)
 
 use axum::{
     Router,
@@ -18,7 +20,8 @@ use axum::{
 use chrono::Utc;
 use tracing::debug;
 
-use crate::api::AppState;
+#[allow(unused_imports)]
+use crate::api::{AppState, ApiResponse};
 use crate::agents::status::SystemStatus;
 
 // ── Handlers ───────────────────────────────────────────────────────────────
@@ -43,60 +46,68 @@ pub async fn health_handler(State(state): State<AppState>) -> impl IntoResponse 
 
 /// GET /ready — readiness probe.
 ///
-/// Returns 200 if the database is connected AND the orchestrator has
-/// at least one agent registered.  Returns 503 otherwise with a
-/// human-readable `reason` field explaining what is not ready.
+/// Returns 200 when the system is ready to serve requests:
+/// 1. Database is connected
+/// 2. Orchestrator is running (agents initialized)
+/// 3. Ledger has at least one account (seed data loaded)
+///
+/// Returns 503 with a `reason` array listing which checks failed.
 pub async fn ready_handler(State(state): State<AppState>) -> impl IntoResponse {
-    let timestamp = Utc::now().to_rfc3339();
-
-    // Check database connection (releases the lock immediately).
+    // Check 1: DB connected (releases the lock immediately).
     let db_connected = {
         let db = state.database.lock().await;
         db.is_connected().await
     };
 
-    // Check orchestrator agent count (releases the lock immediately).
-    let agent_count = {
+    // Check 2: Orchestrator running (releases the orchestrator lock immediately).
+    let agents_ready = {
         let orchestrator = state.orchestrator.lock().await;
-        orchestrator.get_system_status().await.total_agents
+        let running = *orchestrator.is_running.lock().await;
+        running
     };
 
-    let db_str = if db_connected { "connected" } else { "disconnected" };
+    // Check 3: Ledger has accounts — seed data loaded (releases the nexus lock immediately).
+    let accounts_count = {
+        let nexus = state.nexus.lock().await;
+        let count = nexus.ledger.accounts.read().await.len();
+        count
+    };
 
-    debug!("Readiness check: db={}, agents={}", db_str, agent_count);
+    debug!(
+        "Readiness check: db={}, agents_ready={}, accounts={}",
+        db_connected, agents_ready, accounts_count
+    );
 
-    let (status_code, body) = if db_connected && agent_count > 0 {
+    if db_connected && agents_ready && accounts_count > 0 {
         (
             StatusCode::OK,
-            serde_json::json!({
+            Json(serde_json::json!({
                 "status": "ready",
-                "db": db_str,
-                "agents": agent_count,
-                "timestamp": timestamp,
-            }),
+                "db": "connected",
+                "agents_initialized": true,
+                "accounts_count": accounts_count,
+            })),
         )
     } else {
-        let reason = if !db_connected && agent_count == 0 {
-            "Database not connected and no agents registered"
-        } else if !db_connected {
-            "Database not connected"
-        } else {
-            "No agents registered"
-        };
+        let mut reason = Vec::new();
+        if !db_connected {
+            reason.push("db_not_connected");
+        }
+        if !agents_ready {
+            reason.push("agents_not_initialized");
+        }
+        if accounts_count == 0 {
+            reason.push("no_accounts");
+        }
 
         (
             StatusCode::SERVICE_UNAVAILABLE,
-            serde_json::json!({
+            Json(serde_json::json!({
                 "status": "not_ready",
-                "db": db_str,
-                "agents": agent_count,
                 "reason": reason,
-                "timestamp": timestamp,
-            }),
+            })),
         )
-    };
-
-    (status_code, Json(body))
+    }
 }
 
 /// GET /metrics — Prometheus metrics endpoint.
@@ -250,8 +261,9 @@ mod tests {
 
     /// Construct a minimal `AppState` for testing.
     ///
-    /// The database is **not** connected and the orchestrator has **zero**
-    /// agents — i.e. the system is in a cold-start / not-ready state.
+    /// The database is **not** connected, the orchestrator is **not**
+    /// running, and the ledger has **zero** accounts — i.e. the system
+    /// is in a cold-start / not-ready state.
     fn make_test_state() -> AppState {
         let orchestrator = Arc::new(Mutex::new(AgentOrchestrator::new()));
         let database = Arc::new(Mutex::new(Database::new()));
@@ -276,19 +288,63 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_ready_returns_503_when_db_not_connected() {
+    async fn test_ready_returns_503_when_nothing_ready() {
         let state = make_test_state();
         let response = ready_handler(State(state)).await.into_response();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
 
-        // Verify the body reports the DB as disconnected.
         let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json["status"], "not_ready");
-        assert_eq!(json["db"], "disconnected");
-        assert_eq!(json["agents"], 0);
-        assert!(json["reason"].as_str().is_some());
-        assert!(json["timestamp"].as_str().is_some());
+
+        // reason is an array listing all failed checks
+        let reason = json["reason"].as_array().unwrap();
+        assert!(reason.contains(&serde_json::json!("db_not_connected")));
+        assert!(reason.contains(&serde_json::json!("agents_not_initialized")));
+        assert!(reason.contains(&serde_json::json!("no_accounts")));
+    }
+
+    #[tokio::test]
+    async fn test_ready_returns_503_when_db_disconnected_only() {
+        // Build a state where the orchestrator is running and accounts exist,
+        // but the database is not connected.
+        let orchestrator = Arc::new(Mutex::new(AgentOrchestrator::new()));
+        let database = Arc::new(Mutex::new(Database::new())); // not connected
+
+        let nexus = Arc::new(Mutex::new(NexusLedger::new()));
+
+        // Seed one account into the ledger so the accounts check passes.
+        {
+            let nexus_guard = nexus.lock().await;
+            let account = crate::database::financial::Account::new(
+                "1000",
+                "Cash",
+                crate::database::financial::AccountType::Asset,
+            );
+            let id = account.id;
+            nexus_guard.ledger.accounts.write().await.insert(id, account);
+        }
+
+        // Mark the orchestrator as running.
+        {
+            let orch = orchestrator.lock().await;
+            *orch.is_running.lock().await = true;
+        }
+
+        let user_repo = Arc::new(SurrealUserRepository::new(None));
+        let config = ApiConfig::default();
+        let state = AppState::new(orchestrator, database, nexus, user_repo, config);
+
+        let response = ready_handler(State(state)).await.into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["status"], "not_ready");
+
+        let reason = json["reason"].as_array().unwrap();
+        assert_eq!(reason.len(), 1);
+        assert_eq!(reason[0], "db_not_connected");
     }
 
     #[test]
