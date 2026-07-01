@@ -38,13 +38,13 @@ pub trait AuditRepository: Send + Sync {
 /// SurrealDB implementation of AuditRepository
 #[derive(Debug, Clone)]
 pub struct SurrealAuditRepository {
-    /// Database connection
-    pub db: Arc<Mutex<Option<surrealdb::Surreal<surrealdb::engine::local::Db>>>>,
+    /// Database connection (cloned Surreal handle — no Mutex needed)
+    pub db: Option<surrealdb::Surreal<surrealdb::engine::local::Db>>,
 }
 
 impl SurrealAuditRepository {
     /// Create a new SurrealDB audit repository
-    pub fn new(db: Arc<Mutex<Option<surrealdb::Surreal<surrealdb::engine::local::Db>>>>) -> Self {
+    pub fn new(db: Option<surrealdb::Surreal<surrealdb::engine::local::Db>>) -> Self {
         Self { db }
     }
 }
@@ -52,8 +52,7 @@ impl SurrealAuditRepository {
 #[async_trait]
 impl AuditRepository for SurrealAuditRepository {
     async fn log(&self, audit_log: AuditLog) -> DatabaseResult<AuditLog> {
-        let guard = self.db.lock().await;
-        let client = guard.as_ref().ok_or(DatabaseError::NotInitialized)?;
+        let client = self.db.as_ref().ok_or(DatabaseError::NotInitialized)?;
 
         let user_id_str = audit_log.user_id.map(|id| id.to_string());
         let action_str = self.action_to_string(&audit_log.action);
@@ -99,8 +98,7 @@ impl AuditRepository for SurrealAuditRepository {
     }
 
     async fn find_by_user(&self, user_id: Uuid) -> DatabaseResult<Vec<AuditLog>> {
-        let guard = self.db.lock().await;
-        let client = guard.as_ref().ok_or(DatabaseError::NotInitialized)?;
+        let client = self.db.as_ref().ok_or(DatabaseError::NotInitialized)?;
 
         let mut response = client.query(
             "SELECT * FROM audit_log WHERE user_id = $user_id ORDER BY timestamp DESC"
@@ -118,8 +116,7 @@ impl AuditRepository for SurrealAuditRepository {
     }
 
     async fn find_by_entity(&self, entity_type: &str, entity_id: &str) -> DatabaseResult<Vec<AuditLog>> {
-        let guard = self.db.lock().await;
-        let client = guard.as_ref().ok_or(DatabaseError::NotInitialized)?;
+        let client = self.db.as_ref().ok_or(DatabaseError::NotInitialized)?;
 
         let mut response = client.query(
             "SELECT * FROM audit_log WHERE entity_type = $entity_type AND entity_id = $entity_id ORDER BY timestamp DESC"
@@ -138,8 +135,7 @@ impl AuditRepository for SurrealAuditRepository {
     }
 
     async fn find_by_action(&self, action: AuditAction) -> DatabaseResult<Vec<AuditLog>> {
-        let guard = self.db.lock().await;
-        let client = guard.as_ref().ok_or(DatabaseError::NotInitialized)?;
+        let client = self.db.as_ref().ok_or(DatabaseError::NotInitialized)?;
 
         let action_str = self.action_to_string(&action);
 
@@ -159,8 +155,7 @@ impl AuditRepository for SurrealAuditRepository {
     }
 
     async fn find_by_date_range(&self, start: DateTime<Utc>, end: DateTime<Utc>) -> DatabaseResult<Vec<AuditLog>> {
-        let guard = self.db.lock().await;
-        let client = guard.as_ref().ok_or(DatabaseError::NotInitialized)?;
+        let client = self.db.as_ref().ok_or(DatabaseError::NotInitialized)?;
 
         let mut response = client.query(
             "SELECT * FROM audit_log WHERE timestamp >= $start AND timestamp <= $end ORDER BY timestamp DESC"
@@ -179,8 +174,7 @@ impl AuditRepository for SurrealAuditRepository {
     }
 
     async fn list_all(&self) -> DatabaseResult<Vec<AuditLog>> {
-        let guard = self.db.lock().await;
-        let client = guard.as_ref().ok_or(DatabaseError::NotInitialized)?;
+        let client = self.db.as_ref().ok_or(DatabaseError::NotInitialized)?;
 
         let mut response = client.query(
             "SELECT * FROM audit_log ORDER BY timestamp DESC"
@@ -197,8 +191,7 @@ impl AuditRepository for SurrealAuditRepository {
     }
 
     async fn delete_older_than(&self, date: DateTime<Utc>) -> DatabaseResult<u64> {
-        let guard = self.db.lock().await;
-        let client = guard.as_ref().ok_or(DatabaseError::NotInitialized)?;
+        let client = self.db.as_ref().ok_or(DatabaseError::NotInitialized)?;
 
         // Count the records that will be deleted
         let mut count_response = client.query(

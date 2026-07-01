@@ -9,6 +9,10 @@ use uuid::Uuid;
 use chrono::{DateTime, Utc};
 use tracing::{info, error, debug, warn};
 use serde::{Serialize, Deserialize};
+use prometheus::{
+    Encoder, Gauge, Histogram, HistogramOpts, IntCounter, IntCounterVec,
+    Opts, Registry, TextEncoder,
+};
 use crate::agents::status::{SystemStatus, AgentStatusInfo};
 use crate::agents::orchestrator::AgentOrchestrator;
 
@@ -96,17 +100,25 @@ pub struct SystemMonitor {
     pub historical_metrics: Arc<RwLock<Vec<SystemMetrics>>>,
     /// Alerts
     pub alerts: Arc<RwLock<Vec<Alert>>>,
+    /// Optional Prometheus metrics exporter
+    pub prometheus: Option<Arc<PrometheusExporter>>,
 }
 
 impl SystemMonitor {
     /// Create a new system monitor
     pub fn new(config: MonitorConfig, orchestrator: Arc<AgentOrchestrator>) -> Self {
+        let prometheus = if config.enable_prometheus {
+            Some(Arc::new(PrometheusExporter::new()))
+        } else {
+            None
+        };
         Self {
             config,
             orchestrator,
             metrics: Arc::new(RwLock::new(HashMap::new())),
             historical_metrics: Arc::new(RwLock::new(Vec::new())),
             alerts: Arc::new(RwLock::new(Vec::new())),
+            prometheus,
         }
     }
 
@@ -164,7 +176,13 @@ impl SystemMonitor {
         
         // Store historical metrics
         self.historical_metrics.write().await.push(system_metrics);
-        
+
+        // Update Prometheus metrics if enabled
+        if let Some(ref exporter) = self.prometheus {
+            exporter.update_from_system_status(&system_status);
+            debug!("Prometheus metrics updated from system status");
+        }
+
         // Clean up old metrics
         self.cleanup_old_metrics().await?;
         
@@ -398,6 +416,57 @@ impl SystemMonitor {
             ],
         }
     }
+
+    /// Render metrics in Prometheus text exposition format.
+    ///
+    /// If Prometheus export is enabled, syncs agent gauges from the current
+    /// system status and returns all registered metrics as a
+    /// Prometheus-compatible string. Returns an empty string if Prometheus
+    /// export is disabled.
+    pub async fn render_prometheus_metrics(&self) -> String {
+        if let Some(ref exporter) = self.prometheus {
+            // Sync gauges from current system status before rendering
+            let status = self.orchestrator.get_system_status().await;
+            exporter.update_from_system_status(&status);
+            exporter.export_metrics()
+        } else {
+            String::new()
+        }
+    }
+
+    /// Record an HTTP request in Prometheus metrics.
+    ///
+    /// Increments the request counter with the given `method`, `path`, and
+    /// `status` labels, observes the request duration in the histogram, and
+    /// increments the error counter if the status code is 4xx or 5xx.
+    pub fn record_request(&self, method: &str, path: &str, status: u16, duration: std::time::Duration) {
+        if let Some(ref exporter) = self.prometheus {
+            exporter.record_request(method, path, status, duration);
+        }
+    }
+
+    /// Record a completed task in Prometheus metrics.
+    ///
+    /// Increments the `nexus_tasks_total` counter with `status="completed"`.
+    pub fn record_task_completed(&self) {
+        if let Some(ref exporter) = self.prometheus {
+            exporter.record_task_completed();
+        }
+    }
+
+    /// Record a failed task in Prometheus metrics.
+    ///
+    /// Increments the `nexus_tasks_total` counter with `status="failed"`.
+    pub fn record_task_failed(&self) {
+        if let Some(ref exporter) = self.prometheus {
+            exporter.record_task_failed();
+        }
+    }
+
+    /// Get a reference to the Prometheus exporter, if enabled.
+    pub fn prometheus_exporter(&self) -> Option<&PrometheusExporter> {
+        self.prometheus.as_deref()
+    }
 }
 
 /// Metric types
@@ -531,6 +600,204 @@ pub struct SystemHealth {
     pub checks: Vec<HealthCheck>,
 }
 
+// ---------------------------------------------------------------------------
+// Prometheus Metrics Exporter
+// ---------------------------------------------------------------------------
+
+/// Prometheus metrics exporter for the NexusLedger system.
+///
+/// Registers and exposes Prometheus-compatible metrics including agent
+/// counts, task counters, request counters, and request duration histograms.
+///
+/// Uses an explicit [`Registry`] rather than the default global registry so
+/// that each instance (including test instances) owns its own metric set and
+/// does not interfere with other exporters.
+///
+/// # Registered Metrics
+///
+/// | Name                                | Type      | Labels                          |
+/// |-------------------------------------|-----------|---------------------------------|
+/// | `nexus_agents_active`               | Gauge     | —                               |
+/// | `nexus_agents_idle`                 | Gauge     | —                               |
+/// | `nexus_agents_busy`                 | Gauge     | —                               |
+/// | `nexus_agents_error`                | Gauge     | —                               |
+/// | `nexus_tasks_total`                 | Counter   | `status` (completed / failed)  |
+/// | `nexus_requests_total`              | Counter   | `method`, `path`, `status`     |
+/// | `nexus_errors_total`                | Counter   | —                               |
+/// | `nexus_request_duration_seconds`    | Histogram | —                               |
+#[derive(Debug)]
+pub struct PrometheusExporter {
+    /// Private registry that owns all registered metrics.
+    registry: Registry,
+    // --- Agent gauges (no labels) ---
+    agents_active: Gauge,
+    agents_idle: Gauge,
+    agents_busy: Gauge,
+    agents_error: Gauge,
+    // --- Counters ---
+    /// Total tasks by status (`completed` / `failed`).
+    tasks_total: IntCounterVec,
+    /// Total HTTP requests by method, path, and status code.
+    requests_total: IntCounterVec,
+    /// Total errors encountered.
+    errors_total: IntCounter,
+    // --- Histograms ---
+    /// HTTP request latency distribution.
+    request_duration: Histogram,
+}
+
+impl Default for PrometheusExporter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PrometheusExporter {
+    /// Create a new `PrometheusExporter` with all metrics pre-registered.
+    ///
+    /// Every metric is constructed via `with_opts` (no default-registry side
+    /// effect) and then explicitly registered on the exporter's private
+    /// [`Registry`].
+    pub fn new() -> Self {
+        let registry = Registry::new();
+
+        // -- Agent gauges --
+        let agents_active = Gauge::with_opts(
+            Opts::new("nexus_agents_active", "Number of active agents")
+        ).expect("failed to create nexus_agents_active gauge");
+        let agents_idle = Gauge::with_opts(
+            Opts::new("nexus_agents_idle", "Number of idle agents")
+        ).expect("failed to create nexus_agents_idle gauge");
+        let agents_busy = Gauge::with_opts(
+            Opts::new("nexus_agents_busy", "Number of busy agents")
+        ).expect("failed to create nexus_agents_busy gauge");
+        let agents_error = Gauge::with_opts(
+            Opts::new("nexus_agents_error", "Number of agents in error state")
+        ).expect("failed to create nexus_agents_error gauge");
+
+        registry.register(Box::new(agents_active.clone()))
+            .expect("failed to register nexus_agents_active");
+        registry.register(Box::new(agents_idle.clone()))
+            .expect("failed to register nexus_agents_idle");
+        registry.register(Box::new(agents_busy.clone()))
+            .expect("failed to register nexus_agents_busy");
+        registry.register(Box::new(agents_error.clone()))
+            .expect("failed to register nexus_agents_error");
+
+        // -- Counters --
+        let tasks_total = IntCounterVec::new(
+            Opts::new("nexus_tasks_total", "Total number of tasks processed"),
+            &["status"],
+        ).expect("failed to create nexus_tasks_total counter vec");
+        registry.register(Box::new(tasks_total.clone()))
+            .expect("failed to register nexus_tasks_total");
+        // Initialize label values so they appear in metrics output even before first increment
+        tasks_total.with_label_values(&["completed"]).inc_by(0);
+        tasks_total.with_label_values(&["failed"]).inc_by(0);
+
+        let requests_total = IntCounterVec::new(
+            Opts::new("nexus_requests_total", "Total number of HTTP requests"),
+            &["method", "path", "status"],
+        ).expect("failed to create nexus_requests_total counter vec");
+        registry.register(Box::new(requests_total.clone()))
+            .expect("failed to register nexus_requests_total");
+        requests_total.with_label_values(&["GET", "/", "200"]).inc_by(0);
+
+        let errors_total = IntCounter::with_opts(
+            Opts::new("nexus_errors_total", "Total number of errors")
+        ).expect("failed to create nexus_errors_total counter");
+        registry.register(Box::new(errors_total.clone()))
+            .expect("failed to register nexus_errors_total");
+
+        // -- Histogram --
+        let request_duration = Histogram::with_opts(
+            HistogramOpts::new(
+                "nexus_request_duration_seconds",
+                "HTTP request duration in seconds",
+            )
+            .buckets(vec![0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0]),
+        ).expect("failed to create nexus_request_duration_seconds histogram");
+        registry.register(Box::new(request_duration.clone()))
+            .expect("failed to register nexus_request_duration_seconds");
+
+        Self {
+            registry,
+            agents_active,
+            agents_idle,
+            agents_busy,
+            agents_error,
+            tasks_total,
+            requests_total,
+            errors_total,
+            request_duration,
+        }
+    }
+
+    /// Export all registered metrics in Prometheus text exposition format.
+    ///
+    /// Uses [`TextEncoder`] to produce a string suitable for scraping via an
+    /// HTTP `/metrics` endpoint. Returns an empty string if encoding fails.
+    pub fn export_metrics(&self) -> String {
+        let metric_families = self.registry.gather();
+        let encoder = TextEncoder::new();
+        let mut buffer = Vec::new();
+        if encoder.encode(&metric_families, &mut buffer).is_err() {
+            warn!("Failed to encode Prometheus metrics");
+            return String::new();
+        }
+        String::from_utf8_lossy(&buffer).into_owned()
+    }
+
+    /// Update agent gauges from the orchestrator's system status.
+    ///
+    /// Sets the four agent gauges (`active`, `idle`, `busy`, `error`) to the
+    /// values reported by [`SystemStatus`]. This method is idempotent —
+    /// gauges can be set repeatedly without side effects.
+    pub fn update_from_system_status(&self, status: &SystemStatus) {
+        self.agents_active.set(status.active_agents as f64);
+        self.agents_idle.set(status.idle_agents as f64);
+        self.agents_busy.set(status.busy_agents as f64);
+        self.agents_error.set(status.error_agents as f64);
+    }
+
+    /// Record an HTTP request.
+    ///
+    /// Increments the `nexus_requests_total` counter with the given `method`,
+    /// `path`, and `status` labels, observes the request duration in the
+    /// `nexus_request_duration_seconds` histogram, and increments the
+    /// `nexus_errors_total` counter when the status code is 4xx or 5xx.
+    pub fn record_request(&self, method: &str, path: &str, status: u16, duration: std::time::Duration) {
+        let status_str = status.to_string();
+
+        // Increment request counter
+        self.requests_total
+            .with_label_values(&[method, path, status_str.as_str()])
+            .inc();
+
+        // Observe request duration in seconds
+        self.request_duration.observe(duration.as_secs_f64());
+
+        // Increment error counter for client/server error responses
+        if status >= 400 {
+            self.errors_total.inc();
+        }
+    }
+
+    /// Record a completed task.
+    ///
+    /// Increments the `nexus_tasks_total` counter with `status="completed"`.
+    pub fn record_task_completed(&self) {
+        self.tasks_total.with_label_values(&["completed"]).inc();
+    }
+
+    /// Record a failed task.
+    ///
+    /// Increments the `nexus_tasks_total` counter with `status="failed"`.
+    pub fn record_task_failed(&self) {
+        self.tasks_total.with_label_values(&["failed"]).inc();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -616,12 +883,263 @@ mod tests {
     async fn test_system_health() {
         let config = MonitorConfig::default();
         let orchestrator = Arc::new(AgentOrchestrator::new());
-        
+
         let monitor = SystemMonitor::new(config, orchestrator);
-        
+
         let health = monitor.get_system_health().await;
         assert!(health.score >= 0.0);
         assert!(health.score <= 1.0);
         assert!(!health.checks.is_empty());
+    }
+
+    // -- Prometheus exporter tests ------------------------------------------
+
+    #[test]
+    fn test_prometheus_exporter_creation() {
+        let exporter = PrometheusExporter::new();
+        let output = exporter.export_metrics();
+
+        // All registered metric names should appear in the text output
+        assert!(output.contains("nexus_agents_active"), "missing nexus_agents_active");
+        assert!(output.contains("nexus_agents_idle"), "missing nexus_agents_idle");
+        assert!(output.contains("nexus_agents_busy"), "missing nexus_agents_busy");
+        assert!(output.contains("nexus_agents_error"), "missing nexus_agents_error");
+        assert!(output.contains("nexus_tasks_total"), "missing nexus_tasks_total");
+        assert!(output.contains("nexus_requests_total"), "missing nexus_requests_total");
+        assert!(output.contains("nexus_errors_total"), "missing nexus_errors_total");
+        assert!(output.contains("nexus_request_duration_seconds"), "missing nexus_request_duration_seconds");
+
+        // Verify TYPE declarations
+        assert!(output.contains("# TYPE nexus_agents_active gauge"));
+        assert!(output.contains("# TYPE nexus_tasks_total counter"));
+        assert!(output.contains("# TYPE nexus_request_duration_seconds histogram"));
+    }
+
+    #[test]
+    fn test_prometheus_exporter_default() {
+        let exporter = PrometheusExporter::default();
+        let output = exporter.export_metrics();
+        assert!(!output.is_empty());
+    }
+
+    #[test]
+    fn test_prometheus_update_from_system_status() {
+        let exporter = PrometheusExporter::new();
+
+        let mut status = SystemStatus::default();
+        status.active_agents = 5;
+        status.idle_agents = 3;
+        status.busy_agents = 2;
+        status.error_agents = 1;
+
+        exporter.update_from_system_status(&status);
+
+        let output = exporter.export_metrics();
+
+        // Gauges should reflect the values we set
+        assert!(output.contains("nexus_agents_active 5"), "active gauge mismatch");
+        assert!(output.contains("nexus_agents_idle 3"), "idle gauge mismatch");
+        assert!(output.contains("nexus_agents_busy 2"), "busy gauge mismatch");
+        assert!(output.contains("nexus_agents_error 1"), "error gauge mismatch");
+    }
+
+    #[test]
+    fn test_prometheus_update_is_idempotent() {
+        let exporter = PrometheusExporter::new();
+
+        let mut status = SystemStatus::default();
+        status.active_agents = 10;
+        status.idle_agents = 5;
+
+        // Calling twice should not double the value (gauges, not counters)
+        exporter.update_from_system_status(&status);
+        exporter.update_from_system_status(&status);
+
+        let output = exporter.export_metrics();
+        assert!(output.contains("nexus_agents_active 10"), "gauge should still be 10 after second call");
+        assert!(output.contains("nexus_agents_idle 5"), "gauge should still be 5 after second call");
+    }
+
+    #[test]
+    fn test_prometheus_record_request() {
+        let exporter = PrometheusExporter::new();
+
+        // Record three requests with different statuses and durations
+        exporter.record_request("GET", "/api/transactions", 200, std::time::Duration::from_millis(50));
+        exporter.record_request("POST", "/api/transactions", 201, std::time::Duration::from_millis(100));
+        exporter.record_request("GET", "/api/transactions", 500, std::time::Duration::from_millis(2000));
+
+        let output = exporter.export_metrics();
+
+        // Request counter should contain the label values
+        assert!(output.contains("nexus_requests_total"), "missing nexus_requests_total");
+        assert!(output.contains("method=\"GET\""), "missing GET method label");
+        assert!(output.contains("method=\"POST\""), "missing POST method label");
+        assert!(output.contains("path=\"/api/transactions\""), "missing path label");
+        assert!(output.contains("status=\"200\""), "missing status 200 label");
+        assert!(output.contains("status=\"500\""), "missing status 500 label");
+
+        // Error counter should be 1 (only the 500 response)
+        assert!(output.contains("nexus_errors_total 1"), "error counter should be 1");
+
+        // Histogram should have observed 3 values
+        assert!(output.contains("nexus_request_duration_seconds_count 3"), "histogram count should be 3");
+
+        // Histogram buckets should be present
+        assert!(output.contains("nexus_request_duration_seconds_bucket"), "missing histogram buckets");
+    }
+
+    #[test]
+    fn test_prometheus_record_request_no_error_on_success() {
+        let exporter = PrometheusExporter::new();
+
+        exporter.record_request("GET", "/api/health", 200, std::time::Duration::from_millis(5));
+        exporter.record_request("GET", "/api/health", 204, std::time::Duration::from_millis(3));
+
+        let output = exporter.export_metrics();
+        // No 4xx/5xx responses — error counter should remain 0
+        assert!(output.contains("nexus_errors_total 0"), "error counter should be 0 for successful requests");
+    }
+
+    #[test]
+    fn test_prometheus_record_task_completed() {
+        let exporter = PrometheusExporter::new();
+
+        exporter.record_task_completed();
+        exporter.record_task_completed();
+        exporter.record_task_completed();
+
+        let output = exporter.export_metrics();
+
+        // The completed counter should be 3
+        assert!(output.contains("nexus_tasks_total"), "missing nexus_tasks_total");
+        assert!(output.contains("status=\"completed\""), "missing completed label");
+        // Find the line with completed label and verify value is 3
+        let completed_line = output.lines()
+            .find(|line| line.contains("nexus_tasks_total") && line.contains("completed") && !line.starts_with('#'))
+            .expect("should find completed task counter line");
+        assert!(completed_line.contains(" 3"), "completed counter should be 3, got: {}", completed_line);
+    }
+
+    #[test]
+    fn test_prometheus_record_task_failed() {
+        let exporter = PrometheusExporter::new();
+
+        exporter.record_task_failed();
+        exporter.record_task_failed();
+
+        let output = exporter.export_metrics();
+
+        assert!(output.contains("status=\"failed\""), "missing failed label");
+        let failed_line = output.lines()
+            .find(|line| line.contains("nexus_tasks_total") && line.contains("failed") && !line.starts_with('#'))
+            .expect("should find failed task counter line");
+        assert!(failed_line.contains(" 2"), "failed counter should be 2, got: {}", failed_line);
+    }
+
+    #[test]
+    fn test_prometheus_histogram_buckets() {
+        let exporter = PrometheusExporter::new();
+
+        // 5ms  → bucket le="0.01"
+        // 40ms → bucket le="0.05"
+        // 80ms → bucket le="0.1"
+        // 300ms→ bucket le="0.5"
+        // 750ms→ bucket le="1"
+        // 3s   → bucket le="5"
+        // 8s   → bucket le="10"
+        exporter.record_request("GET", "/test", 200, std::time::Duration::from_millis(5));
+        exporter.record_request("GET", "/test", 200, std::time::Duration::from_millis(40));
+        exporter.record_request("GET", "/test", 200, std::time::Duration::from_millis(80));
+        exporter.record_request("GET", "/test", 200, std::time::Duration::from_millis(300));
+        exporter.record_request("GET", "/test", 200, std::time::Duration::from_millis(750));
+        exporter.record_request("GET", "/test", 200, std::time::Duration::from_secs(3));
+        exporter.record_request("GET", "/test", 200, std::time::Duration::from_secs(8));
+
+        let output = exporter.export_metrics();
+
+        // Cumulative histogram: each bucket includes all values ≤ its upper bound
+        // le="0.01" → 1 (5ms)
+        assert!(output.contains("le=\"0.01\"} 1"), "bucket le=0.01 should have 1");
+        // le="0.05" → 2 (5ms + 40ms)
+        assert!(output.contains("le=\"0.05\"} 2"), "bucket le=0.05 should have 2");
+        // le="0.1"  → 3
+        assert!(output.contains("le=\"0.1\"} 3"), "bucket le=0.1 should have 3");
+        // le="0.5"  → 4
+        assert!(output.contains("le=\"0.5\"} 4"), "bucket le=0.5 should have 4");
+        // le="1"    → 5
+        assert!(output.contains("le=\"1\"} 5"), "bucket le=1 should have 5");
+        // le="5"    → 6
+        assert!(output.contains("le=\"5\"} 6"), "bucket le=5 should have 6");
+        // le="10"   → 7
+        assert!(output.contains("le=\"10\"} 7"), "bucket le=10 should have 7");
+        // le="+Inf" → 7
+        assert!(output.contains("le=\"+Inf\"} 7"), "bucket le=+Inf should have 7");
+        // count → 7
+        assert!(output.contains("nexus_request_duration_seconds_count 7"), "count should be 7");
+    }
+
+    #[tokio::test]
+    async fn test_system_monitor_with_prometheus_disabled() {
+        let config = MonitorConfig {
+            enable_prometheus: false,
+            ..MonitorConfig::default()
+        };
+        let orchestrator = Arc::new(AgentOrchestrator::new());
+        let monitor = SystemMonitor::new(config, orchestrator);
+
+        // When prometheus is disabled, render should return empty string
+        let output = monitor.render_prometheus_metrics().await;
+        assert!(output.is_empty(), "expected empty output when prometheus is disabled");
+
+        // prometheus_exporter should return None
+        assert!(monitor.prometheus_exporter().is_none());
+
+        // record_request should be a no-op (no panic)
+        monitor.record_request("GET", "/test", 200, std::time::Duration::from_millis(10));
+        monitor.record_task_completed();
+        monitor.record_task_failed();
+    }
+
+    #[tokio::test]
+    async fn test_system_monitor_with_prometheus_enabled() {
+        let config = MonitorConfig {
+            enable_prometheus: true,
+            ..MonitorConfig::default()
+        };
+        let orchestrator = Arc::new(AgentOrchestrator::new());
+        let monitor = SystemMonitor::new(config, orchestrator);
+
+        // render_prometheus_metrics should return a non-empty string with metric names
+        let output = monitor.render_prometheus_metrics().await;
+        assert!(!output.is_empty(), "expected non-empty output when prometheus is enabled");
+        assert!(output.contains("nexus_agents_active"), "output should contain nexus_agents_active");
+        assert!(output.contains("nexus_tasks_total"), "output should contain nexus_tasks_total");
+        assert!(output.contains("nexus_requests_total"), "output should contain nexus_requests_total");
+
+        // prometheus_exporter should return Some
+        assert!(monitor.prometheus_exporter().is_some());
+
+        // record_request should update the exporter
+        monitor.record_request("GET", "/api/test", 200, std::time::Duration::from_millis(50));
+        let output = monitor.render_prometheus_metrics().await;
+        assert!(output.contains("/api/test"), "output should contain the recorded request path");
+    }
+
+    #[tokio::test]
+    async fn test_system_monitor_collect_metrics_updates_prometheus() {
+        let config = MonitorConfig {
+            enable_prometheus: true,
+            ..MonitorConfig::default()
+        };
+        let orchestrator = Arc::new(AgentOrchestrator::new());
+        let monitor = SystemMonitor::new(config, orchestrator);
+
+        // collect_metrics should update prometheus gauges from system status
+        monitor.collect_metrics().await.unwrap();
+
+        let output = monitor.render_prometheus_metrics().await;
+        // After collection, gauges should have values (even if 0 for a fresh orchestrator)
+        assert!(output.contains("nexus_agents_active"), "gauges should be present after collect_metrics");
     }
 }

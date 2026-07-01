@@ -45,7 +45,7 @@ async fn main() -> Result<(), anyhow::Error> {
     let db = Arc::new(Mutex::new(db));
 
     // Create user repository sharing the same DB client
-    let user_repo = Arc::new(SurrealUserRepository::new(db.lock().await.client()));
+    let user_repo = Arc::new(SurrealUserRepository::new(db.lock().await.db().await.ok()));
 
     // Ensure JWT secret is set (refuse to start with default)
     if std::env::var("JWT_SECRET").is_err() {

@@ -78,13 +78,13 @@ pub struct DocumentAgent {
     pub config: AgentConfig,
     /// Current status
     pub status: AgentStatus,
-    /// Database connection
-    pub db: Arc<Mutex<Option<surrealdb::Surreal<surrealdb::engine::local::Db>>>>,
+    /// Database connection (cloned Surreal handle — no Mutex needed)
+    pub db: Option<surrealdb::Surreal<surrealdb::engine::local::Db>>,
 }
 
 impl DocumentAgent {
     /// Create a new document agent
-    pub fn new(config: AgentConfig, db: Arc<Mutex<Option<surrealdb::Surreal<surrealdb::engine::local::Db>>>>) -> Self {
+    pub fn new(config: AgentConfig, db: Option<surrealdb::Surreal<surrealdb::engine::local::Db>>) -> Self {
         Self {
             config,
             status: AgentStatus::Idle,
@@ -93,7 +93,7 @@ impl DocumentAgent {
     }
 
     /// Create a document agent with default configuration
-    pub fn with_defaults(db: Arc<Mutex<Option<surrealdb::Surreal<surrealdb::engine::local::Db>>>>) -> Self {
+    pub fn with_defaults(db: Option<surrealdb::Surreal<surrealdb::engine::local::Db>>) -> Self {
         let config = AgentConfig::document_agent();
         Self::new(config, db)
     }
@@ -237,8 +237,7 @@ impl DocumentAgent {
         stored_document.document_type = classified_type;
 
         // Persist to SurrealDB if connected
-        let db_guard = self.db.lock().await;
-        if let Some(ref client) = *db_guard {
+        if let Some(ref client) = self.db {
             let doc_type_str = stored_document.document_type.to_str().to_string();
             let bbox_json = serde_json::to_value(&stored_document.bounding_box).unwrap_or_default();
             let metadata_json = stored_document.metadata.clone();
@@ -276,8 +275,7 @@ impl DocumentAgent {
         }
 
         // Try SurrealDB first
-        let db_guard = self.db.lock().await;
-        if let Some(ref client) = *db_guard {
+        if let Some(ref client) = self.db {
             let mut result = client.query(
                 "SELECT * FROM document WHERE id = $id LIMIT 1"
             )
@@ -401,7 +399,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_document_agent_creation() {
-        let db = Arc::new(Mutex::new(None));
+        let db = None;
         let agent = DocumentAgent::with_defaults(db);
         assert_eq!(agent.config.agent_type, AgentType::DocumentAgent);
         assert_eq!(agent.status, AgentStatus::Idle);
@@ -409,7 +407,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_document_agent_initialization() {
-        let db = Arc::new(Mutex::new(None));
+        let db = None;
         let mut agent = DocumentAgent::with_defaults(db);
         let result = agent.initialize().await;
         assert!(result.is_ok());
@@ -418,7 +416,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_store_document_task() {
-        let db = Arc::new(Mutex::new(None));
+        let db = None;
         let agent = DocumentAgent::with_defaults(db);
         
         let document = Document {
@@ -443,7 +441,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_retrieve_document_task() {
-        let db = Arc::new(Mutex::new(None));
+        let db = None;
         let agent = DocumentAgent::with_defaults(db);
         
         let task = Task::new(crate::agents::task::TaskType::RetrieveDocument);
@@ -458,7 +456,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_document_classification() {
-        let db = Arc::new(Mutex::new(None));
+        let db = None;
         let agent = DocumentAgent::with_defaults(db);
         
         let document = Document {

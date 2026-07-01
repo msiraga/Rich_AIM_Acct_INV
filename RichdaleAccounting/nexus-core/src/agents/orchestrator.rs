@@ -287,8 +287,8 @@ impl AgentOrchestrator {
             }
             AgentType::DocumentAgent => {
                 let db_client = match &self.database {
-                    Some(db) => db.client(),
-                    None => Arc::new(Mutex::new(None)),
+                    Some(db) => db.db().await.ok(),
+                    None => None,
                 };
                 Arc::new(Mutex::new(crate::agents::document::DocumentAgent::new(
                     config.clone(),
@@ -297,7 +297,7 @@ impl AgentOrchestrator {
             }
             AgentType::AuditAgent => {
                 let audit_repo: Arc<dyn crate::database::audit::AuditRepository> = match &self.database {
-                    Some(db) => Arc::new(crate::database::audit::SurrealAuditRepository::new(db.client())),
+                    Some(db) => Arc::new(crate::database::audit::SurrealAuditRepository::new(db.db().await.ok())),
                     None => Arc::new(crate::database::audit::MemoryAuditRepository::new()),
                 };
                 Arc::new(Mutex::new(crate::audit::AuditAgent::new(

@@ -38,13 +38,13 @@ pub trait DocumentRepository: Send + Sync {
 /// SurrealDB implementation of DocumentRepository
 #[derive(Debug, Clone)]
 pub struct SurrealDocumentRepository {
-    /// Database connection
-    pub db: Arc<Mutex<Option<surrealdb::Surreal<surrealdb::engine::local::Db>>>>,
+    /// Database connection (cloned Surreal handle — no Mutex needed)
+    pub db: Option<surrealdb::Surreal<surrealdb::engine::local::Db>>,
 }
 
 impl SurrealDocumentRepository {
     /// Create a new SurrealDB document repository
-    pub fn new(db: Arc<Mutex<Option<surrealdb::Surreal<surrealdb::engine::local::Db>>>>) -> Self {
+    pub fn new(db: Option<surrealdb::Surreal<surrealdb::engine::local::Db>>) -> Self {
         Self { db }
     }
 }
@@ -52,8 +52,7 @@ impl SurrealDocumentRepository {
 #[async_trait]
 impl DocumentRepository for SurrealDocumentRepository {
     async fn save(&self, document: &Document) -> DatabaseResult<Document> {
-        let guard = self.db.lock().await;
-        let client = guard.as_ref().ok_or(DatabaseError::NotInitialized)?;
+        let client = self.db.as_ref().ok_or(DatabaseError::NotInitialized)?;
 
         let content_b64 = base64::encode(&document.content);
         let mut response = client.query(
@@ -85,8 +84,7 @@ impl DocumentRepository for SurrealDocumentRepository {
     }
 
     async fn find_by_id(&self, id: &str) -> DatabaseResult<Option<Document>> {
-        let guard = self.db.lock().await;
-        let client = guard.as_ref().ok_or(DatabaseError::NotInitialized)?;
+        let client = self.db.as_ref().ok_or(DatabaseError::NotInitialized)?;
 
         let mut response = client.query(
             "SELECT * FROM document WHERE id = $id"
@@ -105,8 +103,7 @@ impl DocumentRepository for SurrealDocumentRepository {
     }
 
     async fn find_by_type(&self, doc_type: DocumentType) -> DatabaseResult<Vec<Document>> {
-        let guard = self.db.lock().await;
-        let client = guard.as_ref().ok_or(DatabaseError::NotInitialized)?;
+        let client = self.db.as_ref().ok_or(DatabaseError::NotInitialized)?;
 
         let mut response = client.query(
             "SELECT * FROM document WHERE document_type = $doc_type"
@@ -124,8 +121,7 @@ impl DocumentRepository for SurrealDocumentRepository {
     }
 
     async fn find_by_name(&self, name: &str) -> DatabaseResult<Vec<Document>> {
-        let guard = self.db.lock().await;
-        let client = guard.as_ref().ok_or(DatabaseError::NotInitialized)?;
+        let client = self.db.as_ref().ok_or(DatabaseError::NotInitialized)?;
 
         let mut response = client.query(
             "SELECT * FROM document WHERE string::contains(name, $name)"
@@ -143,8 +139,7 @@ impl DocumentRepository for SurrealDocumentRepository {
     }
 
     async fn delete(&self, id: &str) -> DatabaseResult<bool> {
-        let guard = self.db.lock().await;
-        let client = guard.as_ref().ok_or(DatabaseError::NotInitialized)?;
+        let client = self.db.as_ref().ok_or(DatabaseError::NotInitialized)?;
 
         // First check if the document exists
         let mut check = client.query(
@@ -172,8 +167,7 @@ impl DocumentRepository for SurrealDocumentRepository {
     }
 
     async fn list_all(&self) -> DatabaseResult<Vec<Document>> {
-        let guard = self.db.lock().await;
-        let client = guard.as_ref().ok_or(DatabaseError::NotInitialized)?;
+        let client = self.db.as_ref().ok_or(DatabaseError::NotInitialized)?;
 
         let mut response = client.query(
             "SELECT * FROM document"
@@ -190,8 +184,7 @@ impl DocumentRepository for SurrealDocumentRepository {
     }
 
     async fn update(&self, id: &str, document: &Document) -> DatabaseResult<Document> {
-        let guard = self.db.lock().await;
-        let client = guard.as_ref().ok_or(DatabaseError::NotInitialized)?;
+        let client = self.db.as_ref().ok_or(DatabaseError::NotInitialized)?;
 
         // Verify the document exists first
         let mut check = client.query(

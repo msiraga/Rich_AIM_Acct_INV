@@ -92,13 +92,13 @@ pub trait UserRepository: Send + Sync {
 /// SurrealDB implementation of UserRepository
 #[derive(Debug, Clone)]
 pub struct SurrealUserRepository {
-    /// Database connection
-    pub db: Arc<Mutex<Option<surrealdb::Surreal<surrealdb::engine::local::Db>>>>,
+    /// Database connection (cloned Surreal handle — no Mutex needed since Surreal<Db> is internally Arc)
+    pub db: Option<surrealdb::Surreal<surrealdb::engine::local::Db>>,
 }
 
 impl SurrealUserRepository {
     /// Create a new SurrealDB user repository
-    pub fn new(db: Arc<Mutex<Option<surrealdb::Surreal<surrealdb::engine::local::Db>>>>) -> Self {
+    pub fn new(db: Option<surrealdb::Surreal<surrealdb::engine::local::Db>>) -> Self {
         Self { db }
     }
 }
@@ -106,8 +106,7 @@ impl SurrealUserRepository {
 #[async_trait]
 impl UserRepository for SurrealUserRepository {
     async fn create(&self, user: User) -> DatabaseResult<User> {
-        let guard = self.db.lock().await;
-        let client = guard.as_ref().ok_or(DatabaseError::NotInitialized)?;
+        let client = self.db.as_ref().ok_or(DatabaseError::NotInitialized)?;
 
         let role_str = self.role_to_string(&user.role);
         let last_login_str = user.last_login.map(|dt| dt.to_rfc3339());
@@ -147,8 +146,7 @@ impl UserRepository for SurrealUserRepository {
     }
 
     async fn find_by_id(&self, id: Uuid) -> DatabaseResult<Option<User>> {
-        let guard = self.db.lock().await;
-        let client = guard.as_ref().ok_or(DatabaseError::NotInitialized)?;
+        let client = self.db.as_ref().ok_or(DatabaseError::NotInitialized)?;
 
         let mut response = client.query(
             "SELECT * FROM user WHERE id = $id"
@@ -167,8 +165,7 @@ impl UserRepository for SurrealUserRepository {
     }
 
     async fn find_by_username(&self, username: &str) -> DatabaseResult<Option<User>> {
-        let guard = self.db.lock().await;
-        let client = guard.as_ref().ok_or(DatabaseError::NotInitialized)?;
+        let client = self.db.as_ref().ok_or(DatabaseError::NotInitialized)?;
 
         let mut response = client.query(
             "SELECT * FROM user WHERE username = $username"
@@ -187,8 +184,7 @@ impl UserRepository for SurrealUserRepository {
     }
 
     async fn find_by_email(&self, email: &str) -> DatabaseResult<Option<User>> {
-        let guard = self.db.lock().await;
-        let client = guard.as_ref().ok_or(DatabaseError::NotInitialized)?;
+        let client = self.db.as_ref().ok_or(DatabaseError::NotInitialized)?;
 
         let mut response = client.query(
             "SELECT * FROM user WHERE email = $email"
@@ -207,8 +203,7 @@ impl UserRepository for SurrealUserRepository {
     }
 
     async fn find_by_role(&self, role: UserRole) -> DatabaseResult<Vec<User>> {
-        let guard = self.db.lock().await;
-        let client = guard.as_ref().ok_or(DatabaseError::NotInitialized)?;
+        let client = self.db.as_ref().ok_or(DatabaseError::NotInitialized)?;
 
         let role_str = self.role_to_string(&role);
 
@@ -228,8 +223,7 @@ impl UserRepository for SurrealUserRepository {
     }
 
     async fn list_all(&self) -> DatabaseResult<Vec<User>> {
-        let guard = self.db.lock().await;
-        let client = guard.as_ref().ok_or(DatabaseError::NotInitialized)?;
+        let client = self.db.as_ref().ok_or(DatabaseError::NotInitialized)?;
 
         let mut response = client.query(
             "SELECT * FROM user"
@@ -246,8 +240,7 @@ impl UserRepository for SurrealUserRepository {
     }
 
     async fn update(&self, id: Uuid, user: User) -> DatabaseResult<User> {
-        let guard = self.db.lock().await;
-        let client = guard.as_ref().ok_or(DatabaseError::NotInitialized)?;
+        let client = self.db.as_ref().ok_or(DatabaseError::NotInitialized)?;
 
         // Verify the user exists
         let mut check = client.query(
@@ -302,8 +295,7 @@ impl UserRepository for SurrealUserRepository {
     }
 
     async fn delete(&self, id: Uuid) -> DatabaseResult<bool> {
-        let guard = self.db.lock().await;
-        let client = guard.as_ref().ok_or(DatabaseError::NotInitialized)?;
+        let client = self.db.as_ref().ok_or(DatabaseError::NotInitialized)?;
 
         // Check if the user exists
         let mut check = client.query(
@@ -331,8 +323,7 @@ impl UserRepository for SurrealUserRepository {
     }
 
     async fn username_exists(&self, username: &str) -> DatabaseResult<bool> {
-        let guard = self.db.lock().await;
-        let client = guard.as_ref().ok_or(DatabaseError::NotInitialized)?;
+        let client = self.db.as_ref().ok_or(DatabaseError::NotInitialized)?;
 
         let mut response = client.query(
             "SELECT count() FROM user WHERE username = $username GROUP ALL"
@@ -353,8 +344,7 @@ impl UserRepository for SurrealUserRepository {
     }
 
     async fn email_exists(&self, email: &str) -> DatabaseResult<bool> {
-        let guard = self.db.lock().await;
-        let client = guard.as_ref().ok_or(DatabaseError::NotInitialized)?;
+        let client = self.db.as_ref().ok_or(DatabaseError::NotInitialized)?;
 
         let mut response = client.query(
             "SELECT count() FROM user WHERE email = $email GROUP ALL"
@@ -375,8 +365,7 @@ impl UserRepository for SurrealUserRepository {
     }
 
     async fn update_password(&self, id: Uuid, password_hash: &str) -> DatabaseResult<()> {
-        let guard = self.db.lock().await;
-        let client = guard.as_ref().ok_or(DatabaseError::NotInitialized)?;
+        let client = self.db.as_ref().ok_or(DatabaseError::NotInitialized)?;
 
         // Verify the user exists
         let mut check = client.query(
@@ -406,8 +395,7 @@ impl UserRepository for SurrealUserRepository {
     }
 
     async fn update_last_login(&self, id: Uuid) -> DatabaseResult<()> {
-        let guard = self.db.lock().await;
-        let client = guard.as_ref().ok_or(DatabaseError::NotInitialized)?;
+        let client = self.db.as_ref().ok_or(DatabaseError::NotInitialized)?;
 
         // Verify the user exists
         let mut check = client.query(

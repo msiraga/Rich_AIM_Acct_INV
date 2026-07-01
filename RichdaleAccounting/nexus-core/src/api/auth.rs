@@ -250,7 +250,7 @@ pub async fn auth_middleware(
     let path = req.uri().path().to_string();
 
     // Public paths
-    if path.starts_with("/auth") || path == "/health" {
+    if path.starts_with("/auth") || path == "/health" || path == "/ready" || path == "/metrics" {
         return next.run(req).await;
     }
 

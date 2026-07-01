@@ -7,6 +7,8 @@
 //! - WebSocket: /ws/chat — conversational agentic interface
 
 pub mod auth;
+pub mod middleware;
+pub mod routes;
 
 use std::sync::Arc;
 use std::collections::HashMap;
@@ -22,7 +24,7 @@ use axum::{
     },
     response::{IntoResponse, Json, Response},
     http::{StatusCode, HeaderValue},
-    middleware::{self, Next},
+    middleware::Next,
 };
 use futures::{SinkExt, StreamExt};
 use tower_http::cors::{CorsLayer, Any};
@@ -228,6 +230,9 @@ impl ApiServer {
             .allow_methods(Any)
             .allow_headers(Any);
 
+        // Initialize rate limiter with default per-role limits
+        middleware::init_rate_limiter(middleware::RateLimitConfig::default());
+
         let jwt_secret = self.config.jwt_secret.clone();
         let auth_layer = axum::middleware::from_fn(move |req, next| {
             auth::auth_middleware(req, next, jwt_secret.clone())
@@ -276,12 +281,15 @@ impl ApiServer {
             .route("/api/v1/users/:id/role", post(update_user_role_handler))
             // ── WebSocket ──
             .route("/ws/chat", get(ws_chat_handler))
-            // ── Health ──
-            .route("/health", get(health_handler))
+            // ── Health / Ready / Metrics ──
+            .route("/health", get(routes::health::health_handler))
+            .route("/ready", get(routes::health::ready_handler))
+            .route("/metrics", get(routes::health::metrics_handler))
             // ── Middleware layers (outermost last = first to execute) ──
+            .layer(axum::middleware::from_fn(middleware::rate_limit_middleware))
             .layer(auth_layer)
-            .layer(middleware::from_fn(error_mapping_middleware))
-            .layer(middleware::from_fn(request_id_middleware))
+            .layer(axum::middleware::from_fn(error_mapping_middleware))
+            .layer(axum::middleware::from_fn(request_id_middleware))
             .layer(cors)
             .with_state(self.state.clone());
 

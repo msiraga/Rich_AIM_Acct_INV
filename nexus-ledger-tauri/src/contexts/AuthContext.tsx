@@ -1,5 +1,5 @@
 import { createContext, useContext, useState, useCallback, useEffect, ReactNode } from "react";
-import { API_BASE } from "../lib/api";
+import { API_BASE, setCsrfToken, clearAuthStorage } from "../lib/api";
 
 interface User {
   user_id: string;
@@ -54,6 +54,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ username, password }),
     });
+
+    // Capture CSRF token issued by the server on successful auth.
+    const csrfToken = res.headers.get("X-CSRF-Token");
+    if (csrfToken) setCsrfToken(csrfToken);
+
     const json = await res.json();
     if (!json.success) throw new Error(json.error || "Login failed");
 
@@ -71,6 +76,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ username, email, password, display_name: displayName }),
     });
+
+    // Capture CSRF token issued by the server on successful auth.
+    const csrfToken = res.headers.get("X-CSRF-Token");
+    if (csrfToken) setCsrfToken(csrfToken);
+
     const json = await res.json();
     if (!json.success) throw new Error(json.error || "Registration failed");
 
@@ -83,9 +93,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const logout = useCallback(() => {
-    localStorage.removeItem(TOKEN_KEY);
-    localStorage.removeItem(REFRESH_KEY);
-    localStorage.removeItem(USER_KEY);
+    clearAuthStorage();
     setState({ user: null, accessToken: null, refreshToken: null, isAuthenticated: false, isLoading: false });
   }, []);
 
@@ -105,6 +113,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ refresh_token: stored.refreshToken }),
         });
+
+        // Capture CSRF token issued/rotated by the server.
+        const csrfToken = res.headers.get("X-CSRF-Token");
+        if (csrfToken) setCsrfToken(csrfToken);
+
         const json = await res.json();
         if (json.success) {
           localStorage.setItem(TOKEN_KEY, json.data.access_token);
